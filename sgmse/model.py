@@ -15,6 +15,25 @@ from sgmse.BEATs import BEATs, BEATsConfig
 import logging
 
 
+class CFGScoreWrapper:
+    """Wraps a ScoreModel to apply Classifier-Free Guidance at inference.
+
+    score = (1 + w) * score_cond - w * score_uncond
+    where w = guidance_scale.
+    """
+    def __init__(self, model, guidance_scale):
+        self.model = model
+        self.guidance_scale = guidance_scale
+        # Expose sde for predictor/corrector compatibility
+        self.sde = model.sde
+
+    def __call__(self, x, t, y, y_wav):
+        score_cond = self.model(x, t, y, y_wav)
+        score_uncond = self.model.forward_uncond(x, t, y)
+        w = self.guidance_scale
+        return (1 + w) * score_cond - w * score_uncond
+
+
 class ScoreModel(pl.LightningModule):
     @staticmethod
     def add_argparse_args(parser):
@@ -23,13 +42,14 @@ class ScoreModel(pl.LightningModule):
         parser.add_argument("--t_eps", type=float, default=0.03, help="The minimum time (3e-2 by default)")
         parser.add_argument("--num_eval_files", type=int, default=20, help="Number of files for speech enhancement performance evaluation during training. Pass 0 to turn off (no checkpoints based on evaluation metrics will be generated).")
         parser.add_argument("--loss_type", type=str, default="mse", choices=("mse", "mae"), help="The type of loss function to use.")
+        parser.add_argument("--p_uncond", type=float, default=0.0, help="Probability of unconditional training for CFG (0.0 = baseline, no CFG)")
         return parser
 
     def __init__(
         self, backbone, sde, lr=1e-4, ema_decay=0.999, t_eps=3e-2,
         num_eval_files=20, loss_type='mse', data_module_cls=None,
         pretrain_class_model="/home3/huyuchen/pytorch_workplace/sgmse/BEATs_iter3_plus_AS2M.pt",
-        inject_type="addition", **kwargs
+        inject_type="addition", p_uncond=0.0, **kwargs
     ):
         """
         Create a new ScoreModel.
@@ -64,6 +84,7 @@ class ScoreModel(pl.LightningModule):
 
         self.classfication_loss = torch.nn.CrossEntropyLoss(reduction='mean')
         self.inject_type = inject_type
+        self.p_uncond = p_uncond
         if self.inject_type == 'concat':
             self.proj = torch.nn.Linear(512, 256)
 
@@ -175,6 +196,10 @@ class ScoreModel(pl.LightningModule):
             ### 1. addition
             # (8, 1, 256, 1)
             noise_emb = self.post_cnn(noise_emb).mean(dim=-1).unsqueeze(1).unsqueeze(-1)
+            # CFG: zero out noise_emb with probability p_uncond
+            if self.training and self.p_uncond > 0:
+                mask = (torch.rand(x.shape[0], device=x.device) >= self.p_uncond).float()
+                noise_emb = noise_emb * mask.view(-1, 1, 1, 1)
             dnn_input = dnn_input + noise_emb
         elif self.inject_type == 'concat':
             ### 2. concat
@@ -310,19 +335,40 @@ class ScoreModel(pl.LightningModule):
     #     score = -self.dnn(dnn_input, t)
     #     return score
 
+    def forward_uncond(self, x, t, y):
+        """Unconditional score: noise embedding is zeroed out."""
+        dnn_input = torch.cat([x, y], dim=1)
+        # No noise embedding added (equivalent to zero noise_emb)
+        score = -self.dnn(dnn_input, t)
+        return score
+
+    def forward_cfg(self, x, t, y, y_wav, guidance_scale=1.0):
+        """CFG inference: score = (1+w) * score_cond - w * score_uncond."""
+        score_cond = self.forward(x, t, y, y_wav)
+        if guidance_scale == 0.0:
+            return score_cond
+        score_uncond = self.forward_uncond(x, t, y)
+        return (1 + guidance_scale) * score_cond - guidance_scale * score_uncond
+
     def to(self, *args, **kwargs):
         """Override PyTorch .to() to also transfer the EMA of the model weights"""
         self.ema.to(*args, **kwargs)
         return super().to(*args, **kwargs)
 
-    def get_pc_sampler(self, predictor_name, corrector_name, y, y_wav, N=None, minibatch=None, **kwargs):
+    def get_pc_sampler(self, predictor_name, corrector_name, y, y_wav, N=None, minibatch=None, guidance_scale=None, **kwargs):
         N = self.sde.N if N is None else N
         sde = self.sde.copy()
         sde.N = N
 
+        # Use CFG wrapper if guidance_scale is set
+        if guidance_scale is not None and guidance_scale != 0.0:
+            score_fn = CFGScoreWrapper(self, guidance_scale)
+        else:
+            score_fn = self
+
         kwargs = {"eps": self.t_eps, **kwargs}
         if minibatch is None:
-            return sampling.get_pc_sampler(predictor_name, corrector_name, sde=sde, score_fn=self, y=y, y_wav=y_wav, **kwargs)
+            return sampling.get_pc_sampler(predictor_name, corrector_name, sde=sde, score_fn=score_fn, y=y, y_wav=y_wav, **kwargs)
         else:
             M = y.shape[0]
             def batched_sampling_fn():
@@ -330,7 +376,7 @@ class ScoreModel(pl.LightningModule):
                 for i in range(int(ceil(M / minibatch))):
                     y_mini = y[i*minibatch:(i+1)*minibatch]
                     y_wav_mini = y_wav[i*minibatch:(i+1)*minibatch]
-                    sampler = sampling.get_pc_sampler(predictor_name, corrector_name, sde=sde, score_fn=self, y=y_mini, y_wav=y_wav_mini, **kwargs)
+                    sampler = sampling.get_pc_sampler(predictor_name, corrector_name, sde=sde, score_fn=score_fn, y=y_mini, y_wav=y_wav_mini, **kwargs)
                     sample, n = sampler()
                     samples.append(sample)
                     ns.append(n)

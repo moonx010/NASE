@@ -15,12 +15,13 @@ if __name__ == '__main__':
     parser.add_argument("--test_dir", type=str, required=True, help='Directory containing the test data (must have subdirectory noisy/)')
     parser.add_argument("--test_set", type=str, default='noisy')
     parser.add_argument("--enhanced_dir", type=str, required=True, help='Directory containing the enhanced data')
-    parser.add_argument("--ckpt", type=str,  help='Path to model checkpoint.')
-    parser.add_argument("--pretrain_class_model", type=str, default="/home3/huyuchen/pytorch_workplace/sgmse/BEATs_iter3_plus_AS2M.pt")
+    parser.add_argument("--ckpt", type=str, help='Path to model checkpoint.')
+    parser.add_argument("--pretrain_class_model", type=str, required=True)
     parser.add_argument("--corrector", type=str, choices=("ald", "langevin", "none"), default="ald", help="Corrector class for the PC sampler.")
     parser.add_argument("--corrector_steps", type=int, default=1, help="Number of corrector steps")
-    parser.add_argument("--snr", type=float, default=0.5, help="SNR value for (annealed) Langevin dynmaics.")
+    parser.add_argument("--snr", type=float, default=0.5, help="SNR value for (annealed) Langevin dynamics.")
     parser.add_argument("--N", type=int, default=30, help="Number of reverse steps")
+    parser.add_argument("--guidance_scale", type=float, default=None, help="CFG guidance scale w. None=no CFG (baseline), 0.0=conditional only, >0=CFG")
     args = parser.parse_args()
 
     noisy_dir = join(args.test_dir, args.test_set)
@@ -37,7 +38,7 @@ if __name__ == '__main__':
     N = args.N
     corrector_steps = args.corrector_steps
 
-    # Load score model, with your specified beats model path in <pretrain_class_model>
+    # Load score model
     model = ScoreModel.load_from_checkpoint(
         checkpoint_file,
         base_dir='',
@@ -50,12 +51,14 @@ if __name__ == '__main__':
 
     noisy_files = sorted(glob.glob('{}/*.wav'.format(noisy_dir)))
 
-    print('start inference!')
+    mode = "CFG w={:.1f}".format(args.guidance_scale) if args.guidance_scale is not None else "baseline (no CFG)"
+    print(f'start inference! mode={mode}, N={N}, files={len(noisy_files)}')
+
     for noisy_file in tqdm(noisy_files):
         filename = noisy_file.split('/')[-1]
-        
+
         # Load wav
-        y, _ = load(noisy_file) 
+        y, _ = load(noisy_file)
         T_orig = y.size(1)
 
         y_wav = y.clone()
@@ -63,17 +66,18 @@ if __name__ == '__main__':
         # Normalize
         norm_factor = y.abs().max()
         y = y / norm_factor
-        
+
         # Prepare DNN input
         Y = torch.unsqueeze(model._forward_transform(model._stft(y.cuda())), 0)
         Y = pad_spec(Y)
-        
-        # Reverse sampling
+
+        # Reverse sampling (with optional CFG)
         sampler = model.get_pc_sampler(
             'reverse_diffusion', corrector_cls, Y.cuda(), y_wav.cuda(), N=N,
-            corrector_steps=corrector_steps, snr=snr)
+            corrector_steps=corrector_steps, snr=snr,
+            guidance_scale=args.guidance_scale)
         sample, _ = sampler()
-        
+
         # Backward transform in time domain
         x_hat = model.to_audio(sample.squeeze(), T_orig)
 
@@ -81,4 +85,4 @@ if __name__ == '__main__':
         x_hat = x_hat * norm_factor
 
         # Write enhanced wav file
-        write(join(target_dir, filename), x_hat.cpu().numpy(), 16000)
+        write(join(target_dir, filename), x_hat.cpu().numpy(), sr)
