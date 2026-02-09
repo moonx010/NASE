@@ -32,6 +32,8 @@ if __name__ == '__main__':
           parser_.add_argument("--backbone", type=str, choices=BackboneRegistry.get_all_names(), default="ncsnpp")
           parser_.add_argument("--sde", type=str, choices=SDERegistry.get_all_names(), default="ouve")
           parser_.add_argument("--no_wandb", action='store_true', help="Turn off logging to W&B, using local default logger instead")
+          parser_.add_argument("--wandb_project", type=str, default="nase-adaptive-guidance")
+          parser_.add_argument("--wandb_name", type=str, default=None, help="W&B run name")
           parser_.add_argument("--pretrain_class_model", type=str, default="/home3/huyuchen/pytorch_workplace/sgmse/BEATs_iter3_plus_AS2M.pt")
           # ["addition", "concat", "cross-attention"]
           parser_.add_argument("--inject_type", type=str, default="addition")
@@ -85,7 +87,7 @@ if __name__ == '__main__':
      if args.no_wandb:
           logger = TensorBoardLogger(save_dir="logs", name="tensorboard")
      else:
-          logger = WandbLogger(project="sgmse", log_model=True, save_dir="logs")
+          logger = WandbLogger(project=args.wandb_project, name=args.wandb_name, log_model=True, save_dir="logs")
           logger.experiment.log_code(".")
 
      # Set up callbacks for logger
