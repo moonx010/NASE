@@ -2,9 +2,15 @@ import argparse
 from argparse import ArgumentParser
 
 import pytorch_lightning as pl
-from pytorch_lightning.plugins import DDPPlugin
 from pytorch_lightning.loggers import WandbLogger, TensorBoardLogger
 from pytorch_lightning.callbacks import ModelCheckpoint
+
+try:
+    from pytorch_lightning.plugins import DDPPlugin
+    _ddp_strategy = DDPPlugin(find_unused_parameters=True)
+except ImportError:
+    from pytorch_lightning.strategies import DDPStrategy
+    _ddp_strategy = DDPStrategy(find_unused_parameters=True)
 
 import wandb
 
@@ -76,12 +82,6 @@ if __name__ == '__main__':
      model.classfication_model.load_state_dict(class_checkpoint['model'], strict=False)
      for param in model.classfication_model.parameters():
           param.requires_grad = True
-     # for name, param in model.classfication_model.named_parameters():
-     #      param.requires_grad = True
-     #      if 'encoder.' in name:
-     #          param.requires_grad = False
-     #      else:
-     #          param.requires_grad = True
 
      # Set up logger configuration
      if args.no_wandb:
@@ -93,20 +93,19 @@ if __name__ == '__main__':
      # Set up callbacks for logger
      callbacks = [ModelCheckpoint(dirpath=f"logs/{logger.version}", save_last=True, filename='{epoch}-last')]
      if args.num_eval_files:
-          checkpoint_callback_pesq = ModelCheckpoint(dirpath=f"logs/{logger.version}", 
+          checkpoint_callback_pesq = ModelCheckpoint(dirpath=f"logs/{logger.version}",
                save_top_k=5, monitor="pesq", mode="max", filename='{epoch}-{pesq:.2f}')
-          checkpoint_callback_si_sdr = ModelCheckpoint(dirpath=f"logs/{logger.version}", 
+          checkpoint_callback_si_sdr = ModelCheckpoint(dirpath=f"logs/{logger.version}",
                save_top_k=1, monitor="si_sdr", mode="max", filename='{epoch}-{si_sdr:.2f}')
           callbacks += [checkpoint_callback_pesq, checkpoint_callback_si_sdr]
 
      # Initialize the Trainer and the DataModule
      trainer = pl.Trainer.from_argparse_args(
           arg_groups['pl.Trainer'],
-          strategy=DDPPlugin(find_unused_parameters=True), logger=logger,
+          strategy=_ddp_strategy, logger=logger,
           log_every_n_steps=10, num_sanity_val_steps=0,
           callbacks=callbacks
      )
 
      # Train model
      trainer.fit(model)
-
