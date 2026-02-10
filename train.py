@@ -77,12 +77,13 @@ if __name__ == '__main__':
           logger = WandbLogger(project=args.wandb_project, name=args.wandb_name, log_model=True, save_dir="logs")
           logger.experiment.log_code(".")
 
-     # Set up callbacks
-     callbacks = [ModelCheckpoint(dirpath=f"logs/{logger.version}", save_last=True, filename='{epoch}-last')]
+     # Set up callbacks - use wandb_name as dir if available, else logger.version
+     log_dir = f"logs/{args.wandb_name}" if args.wandb_name else f"logs/{logger.version}"
+     callbacks = [ModelCheckpoint(dirpath=log_dir, save_last=True, filename='{epoch}-last')]
      if args.num_eval_files:
-          callbacks.append(ModelCheckpoint(dirpath=f"logs/{logger.version}",
+          callbacks.append(ModelCheckpoint(dirpath=log_dir,
                save_top_k=5, monitor="pesq", mode="max", filename='{epoch}-{pesq:.2f}'))
-          callbacks.append(ModelCheckpoint(dirpath=f"logs/{logger.version}",
+          callbacks.append(ModelCheckpoint(dirpath=log_dir,
                save_top_k=1, monitor="si_sdr", mode="max", filename='{epoch}-{si_sdr:.2f}'))
 
      # Initialize Trainer
