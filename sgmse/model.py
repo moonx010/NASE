@@ -335,6 +335,19 @@ class ScoreModel(pl.LightningModule):
     #     score = -self.dnn(dnn_input, t)
     #     return score
 
+    def compute_nc_confidence(self, y_wav):
+        """Compute NC classifier confidence for adaptive guidance.
+
+        Returns:
+            confidence: max softmax probability (scalar or batch)
+            logits: raw NC logits (for analysis)
+        """
+        with torch.no_grad():
+            _, logits, _ = self.classfication_model(y_wav.squeeze(1))
+            probs = torch.softmax(logits, dim=-1)
+            confidence = probs.max(dim=-1)[0]
+        return confidence, logits
+
     def forward_uncond(self, x, t, y):
         """Unconditional score: noise embedding is zeroed out."""
         dnn_input = torch.cat([x, y], dim=1)
