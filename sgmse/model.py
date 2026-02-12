@@ -11,7 +11,7 @@ from sgmse.sdes import SDERegistry
 from sgmse.backbones import BackboneRegistry
 from sgmse.util.inference import evaluate_model
 from sgmse.util.other import pad_spec
-from sgmse.BEATs import BEATs, BEATsConfig
+from sgmse.encoders import get_encoder
 import logging
 
 
@@ -49,7 +49,7 @@ class ScoreModel(pl.LightningModule):
         self, backbone, sde, lr=1e-4, ema_decay=0.999, t_eps=3e-2,
         num_eval_files=20, loss_type='mse', data_module_cls=None,
         pretrain_class_model="/home3/huyuchen/pytorch_workplace/sgmse/BEATs_iter3_plus_AS2M.pt",
-        inject_type="addition", p_uncond=0.0, **kwargs
+        inject_type="addition", p_uncond=0.0, encoder_type="beats", **kwargs
     ):
         """
         Create a new ScoreModel.
@@ -61,23 +61,25 @@ class ScoreModel(pl.LightningModule):
             ema_decay: The decay constant of the parameter EMA (0.999 by default).
             t_eps: The minimum time to practically run for to avoid issues very close to zero (1e-5 by default).
             loss_type: The type of loss to use (wrt. noise z/std). Options are 'mse' (default), 'mae'
+            encoder_type: Noise encoder type ('beats', 'wavlm', 'panns')
         """
         super().__init__()
         if pretrain_class_model is None or len(pretrain_class_model) == 0:
             pretrain_class_model = "/home3/huyuchen/pytorch_workplace/sgmse/BEATs_iter3_plus_AS2M.pt"
-        
+
         # Initialize Backbone DNN
         dnn_cls = BackboneRegistry.get_by_name(backbone)
         self.dnn = dnn_cls(**kwargs)
 
-        # Audio Classififcation Model BEATs
-        class_checkpoint = torch.load(pretrain_class_model)
-        class_cfg = BEATsConfig(class_checkpoint['cfg'])
-        self.classfication_model = BEATs(class_cfg)
+        # Noise encoder (BEATs / WavLM / PANNs)
+        self.encoder_type = encoder_type
+        encoder_cls = get_encoder(encoder_type)
+        self.noise_encoder = encoder_cls(pretrain_class_model=pretrain_class_model)
+        encoder_dim = encoder_cls.embed_dim  # 768 for beats/wavlm, 2048 for panns
 
-        # # Postprocessing modules
+        # Postprocessing modules — input dim adapts to encoder
         self.post_cnn = torch.nn.Sequential(
-            torch.nn.Conv1d(768, 256, 1, 1, 0),
+            torch.nn.Conv1d(encoder_dim, 256, 1, 1, 0),
             torch.nn.PReLU(),
             torch.nn.Conv1d(256, 256, 3, 1, 1)
         )
@@ -114,9 +116,22 @@ class ScoreModel(pl.LightningModule):
 
     # on_load_checkpoint / on_save_checkpoint needed for EMA storing/loading
     def on_load_checkpoint(self, checkpoint):
+        # Remap old 'classfication_model.*' keys to 'noise_encoder.model.*' (BEATs compat)
+        state = checkpoint.get('state_dict', {})
+        remapped = {}
+        for k, v in list(state.items()):
+            if k.startswith('classfication_model.'):
+                new_key = k.replace('classfication_model.', 'noise_encoder.model.', 1)
+                remapped[new_key] = state.pop(k)
+        state.update(remapped)
+
         ema = checkpoint.get('ema', None)
         if ema is not None:
-            self.ema.load_state_dict(checkpoint['ema'])
+            # Also remap EMA shadow params if needed
+            if 'shadow_params' in ema:
+                # EMA stores params by position, not name — no remapping needed
+                pass
+            self.ema.load_state_dict(ema)
         else:
             self._error_loading_ema = True
             warnings.warn("EMA state_dict not found in checkpoint!")
@@ -182,10 +197,10 @@ class ScoreModel(pl.LightningModule):
         return loss
 
     def forward_train(self, x, t, y, y_wav):
-        # x.shape: (8, 1, 256, 256), y.shape: (8, 1, 256, 256), y_wav.shape: (8, 1, 32640), noise_emb: (8, 96, 768)
+        # x.shape: (8, 1, 256, 256), y.shape: (8, 1, 256, 256), y_wav.shape: (8, 1, 32640)
 
-        # noise_emb: (8, 768, 96)
-        noise_emb, logits, _ = self.classfication_model(y_wav.squeeze(1))
+        # noise_emb: (B, T_frames, D) -> transpose to (B, D, T_frames)
+        noise_emb, logits, _ = self.noise_encoder(y_wav.squeeze(1))
         noise_emb = noise_emb.transpose(1, 2).contiguous()
 
         # (8, 2, 256, 256) <--> (B, 2, F, T)
@@ -274,10 +289,10 @@ class ScoreModel(pl.LightningModule):
         return loss
 
     def forward(self, x, t, y, y_wav):
-        # x.shape: (8, 1, 256, 256), y.shape: (8, 1, 256, 256), y_wav.shape: (8, 1, 32640), noise_emb: (8, 96, 768)
+        # x.shape: (8, 1, 256, 256), y.shape: (8, 1, 256, 256), y_wav.shape: (8, 1, 32640)
 
-        # noise_emb: (8, 768, 96)
-        noise_emb, logits, _ = self.classfication_model(y_wav.squeeze(1))
+        # noise_emb: (B, T_frames, D) -> transpose to (B, D, T_frames)
+        noise_emb, logits, _ = self.noise_encoder(y_wav.squeeze(1))
         noise_emb = noise_emb.transpose(1, 2).contiguous()
 
         # (8, 2, 256, 256) <--> (B, 2, F, T)
@@ -343,10 +358,65 @@ class ScoreModel(pl.LightningModule):
             logits: raw NC logits (for analysis)
         """
         with torch.no_grad():
-            _, logits, _ = self.classfication_model(y_wav.squeeze(1))
+            _, logits, _ = self.noise_encoder(y_wav.squeeze(1))
             probs = torch.softmax(logits, dim=-1)
             confidence = probs.max(dim=-1)[0]
         return confidence, logits
+
+    def extract_noise_embedding(self, y_wav):
+        """Extract 256-dim noise embedding (after post_cnn + mean-pool).
+
+        Args:
+            y_wav: (B, 1, T) or (B, T) noisy waveform
+        Returns:
+            embedding: (B, 256) mean-pooled noise embedding
+        """
+        with torch.no_grad():
+            if y_wav.dim() == 3:
+                y_wav = y_wav.squeeze(1)
+            noise_emb, _, _ = self.noise_encoder(y_wav)       # (B, T_frames, D)
+            noise_emb = noise_emb.transpose(1, 2).contiguous()  # (B, D, T_frames)
+            noise_emb = self.post_cnn(noise_emb)               # (B, 256, T_frames)
+            embedding = noise_emb.mean(dim=-1)                  # (B, 256)
+        return embedding
+
+    def compute_embedding_distance(self, y_wav, ref_embeddings, k=10, tau=1.0):
+        """k-NN distance based adaptive guidance scale.
+
+        Args:
+            y_wav: (B, 1, T) noisy waveform
+            ref_embeddings: (N_ref, 256) reference embeddings from training data
+            k: number of nearest neighbors
+            tau: temperature for distance-to-weight mapping
+        Returns:
+            distance: (B,) mean k-NN distance
+            w: (B,) guidance scale = 1 / (1 + dist/tau)
+        """
+        embedding = self.extract_noise_embedding(y_wav)          # (B, 256)
+        distances = torch.cdist(embedding, ref_embeddings)       # (B, N_ref)
+        knn_dist, _ = torch.topk(distances, k, largest=False, dim=-1)  # (B, k)
+        distance = knn_dist.mean(dim=-1)                         # (B,)
+        w = 1.0 / (1.0 + distance / tau)                         # (B,)
+        return distance, w
+
+    def compute_prototype_distance(self, y_wav, prototypes, tau=1.0):
+        """Prototype distance based adaptive guidance scale.
+
+        Uses minimum distance to class prototypes (centroids of training embeddings).
+
+        Args:
+            y_wav: (B, 1, T) noisy waveform
+            prototypes: (N_classes, 256) class prototype embeddings
+            tau: temperature for distance-to-weight mapping
+        Returns:
+            distance: (B,) min distance to any prototype
+            w: (B,) guidance scale = 1 / (1 + dist/tau)
+        """
+        embedding = self.extract_noise_embedding(y_wav)          # (B, 256)
+        distances = torch.cdist(embedding, prototypes)           # (B, N_classes)
+        distance = distances.min(dim=-1)[0]                      # (B,)
+        w = 1.0 / (1.0 + distance / tau)                         # (B,)
+        return distance, w
 
     def forward_uncond(self, x, t, y):
         """Unconditional score: noise embedding is zeroed out."""

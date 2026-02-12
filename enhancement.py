@@ -27,6 +27,12 @@ if __name__ == '__main__':
     parser.add_argument("--adaptive_guidance", action='store_true', help="Enable adaptive guidance (overrides --guidance_scale)")
     parser.add_argument("--w_max", type=float, default=1.0, help="Max guidance scale for adaptive mode")
     parser.add_argument("--guidance_mapping", type=str, default="linear", choices=("linear", "scaled", "binary"), help="Confidence-to-w mapping: linear=w_max*(2c-1), scaled=w_max*c, binary=w_max if c>0.5 else 0")
+    # Distance-based adaptive guidance args
+    parser.add_argument("--distance_method", type=str, default="confidence", choices=("confidence", "knn", "prototype"), help="Adaptive w method: confidence=NC logits, knn=k-NN embedding distance, prototype=prototype distance")
+    parser.add_argument("--ref_embeddings", type=str, default=None, help="Path to reference embeddings .pt file (required for knn/prototype)")
+    parser.add_argument("--k_neighbors", type=int, default=10, help="k for k-NN distance (default=10)")
+    parser.add_argument("--tau", type=float, default=1.0, help="Temperature for distance-to-w mapping (default=1.0)")
+    parser.add_argument("--encoder_type", type=str, default="beats", choices=("beats", "wavlm", "panns"), help="Noise encoder type (must match training)")
     args = parser.parse_args()
 
     noisy_dir = join(args.test_dir, args.test_set)
@@ -50,14 +56,23 @@ if __name__ == '__main__':
         batch_size=16,
         num_workers=0,
         pretrain_class_model=pretrain_class_model,
+        encoder_type=args.encoder_type,
         kwargs=dict(gpu=False))
     model.eval(no_ema=False)
     model.cuda()
 
     noisy_files = sorted(glob.glob('{}/*.wav'.format(noisy_dir)))
 
+    # Load reference embeddings for distance-based methods
+    ref_embeddings = None
+    if args.adaptive_guidance and args.distance_method in ("knn", "prototype"):
+        if args.ref_embeddings is None:
+            raise ValueError(f"--ref_embeddings required for --distance_method={args.distance_method}")
+        ref_embeddings = torch.load(args.ref_embeddings, map_location="cuda", weights_only=True)
+        print(f"Loaded reference embeddings: {args.ref_embeddings} — shape {ref_embeddings.shape}")
+
     if args.adaptive_guidance:
-        mode = f"Adaptive CFG (w_max={args.w_max}, mapping={args.guidance_mapping})"
+        mode = f"Adaptive CFG ({args.distance_method}, w_max={args.w_max}, tau={args.tau})"
     elif args.guidance_scale is not None:
         mode = "CFG w={:.1f}".format(args.guidance_scale)
     else:
@@ -86,16 +101,32 @@ if __name__ == '__main__':
 
         # Determine guidance scale
         if args.adaptive_guidance:
-            confidence, logits = model.compute_nc_confidence(y_wav.cuda())
-            conf = confidence.item()
-            pred_class = torch.argmax(logits, dim=-1).item()
-            if args.guidance_mapping == "linear":
-                w = args.w_max * (2 * conf - 1)
-            elif args.guidance_mapping == "scaled":
-                w = args.w_max * conf
-            elif args.guidance_mapping == "binary":
-                w = args.w_max if conf > 0.5 else 0.0
-            guidance_log.append({"filename": filename, "confidence": round(conf, 4), "pred_class": pred_class, "w": round(w, 4)})
+            if args.distance_method == "confidence":
+                # NC confidence based
+                confidence, logits = model.compute_nc_confidence(y_wav.cuda())
+                conf = confidence.item()
+                pred_class = torch.argmax(logits, dim=-1).item()
+                if args.guidance_mapping == "linear":
+                    w = args.w_max * (2 * conf - 1)
+                elif args.guidance_mapping == "scaled":
+                    w = args.w_max * conf
+                elif args.guidance_mapping == "binary":
+                    w = args.w_max if conf > 0.5 else 0.0
+                guidance_log.append({"filename": filename, "confidence": round(conf, 4), "pred_class": pred_class, "distance": 0.0, "w": round(w, 4)})
+            elif args.distance_method == "knn":
+                # k-NN distance based
+                distance, w_tensor = model.compute_embedding_distance(
+                    y_wav.cuda(), ref_embeddings, k=args.k_neighbors, tau=args.tau)
+                dist_val = distance.item()
+                w = w_tensor.item() * args.w_max
+                guidance_log.append({"filename": filename, "confidence": 0.0, "pred_class": -1, "distance": round(dist_val, 4), "w": round(w, 4)})
+            elif args.distance_method == "prototype":
+                # Prototype distance based
+                distance, w_tensor = model.compute_prototype_distance(
+                    y_wav.cuda(), ref_embeddings, tau=args.tau)
+                dist_val = distance.item()
+                w = w_tensor.item() * args.w_max
+                guidance_log.append({"filename": filename, "confidence": 0.0, "pred_class": -1, "distance": round(dist_val, 4), "w": round(w, 4)})
             gs = w if abs(w) > 1e-6 else None
         else:
             gs = args.guidance_scale
@@ -120,12 +151,16 @@ if __name__ == '__main__':
     if args.adaptive_guidance and guidance_log:
         log_path = join(target_dir, "_guidance_log.csv")
         with open(log_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=["filename", "confidence", "pred_class", "w"])
+            writer = csv.DictWriter(f, fieldnames=["filename", "confidence", "pred_class", "distance", "w"])
             writer.writeheader()
             writer.writerows(guidance_log)
-        confs = [r["confidence"] for r in guidance_log]
         ws = [r["w"] for r in guidance_log]
-        print(f"\nAdaptive guidance stats:")
-        print(f"  confidence: mean={sum(confs)/len(confs):.3f}, min={min(confs):.3f}, max={max(confs):.3f}")
+        print(f"\nAdaptive guidance stats ({args.distance_method}):")
+        if args.distance_method == "confidence":
+            confs = [r["confidence"] for r in guidance_log]
+            print(f"  confidence: mean={sum(confs)/len(confs):.3f}, min={min(confs):.3f}, max={max(confs):.3f}")
+        else:
+            dists = [r["distance"] for r in guidance_log]
+            print(f"  distance: mean={sum(dists)/len(dists):.3f}, min={min(dists):.3f}, max={max(dists):.3f}")
         print(f"  w: mean={sum(ws)/len(ws):.3f}, min={min(ws):.3f}, max={max(ws):.3f}")
         print(f"  log saved to {log_path}")
