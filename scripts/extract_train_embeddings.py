@@ -13,11 +13,15 @@ Usage:
 """
 import argparse
 import os
+import sys
 import torch
 from tqdm import tqdm
 from glob import glob
 from os.path import join
 from torchaudio import load
+
+# Add project root to path when running from scripts/
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from sgmse.model import ScoreModel
 
