@@ -363,59 +363,65 @@ class ScoreModel(pl.LightningModule):
             confidence = probs.max(dim=-1)[0]
         return confidence, logits
 
-    def extract_noise_embedding(self, y_wav):
-        """Extract 256-dim noise embedding (after post_cnn + mean-pool).
+    def extract_noise_embedding(self, y_wav, use_raw=False):
+        """Extract noise embedding with L2 normalization.
 
         Args:
             y_wav: (B, 1, T) or (B, T) noisy waveform
+            use_raw: if True, use BEATs raw features (768-dim) instead of post_cnn (256-dim)
         Returns:
-            embedding: (B, 256) mean-pooled noise embedding
+            embedding: (B, D) L2-normalized embedding
         """
         with torch.no_grad():
             if y_wav.dim() == 3:
                 y_wav = y_wav.squeeze(1)
-            noise_emb, _, _ = self.noise_encoder(y_wav)       # (B, T_frames, D)
-            noise_emb = noise_emb.transpose(1, 2).contiguous()  # (B, D, T_frames)
-            noise_emb = self.post_cnn(noise_emb)               # (B, 256, T_frames)
-            embedding = noise_emb.mean(dim=-1)                  # (B, 256)
+            noise_emb, _, _ = self.noise_encoder(y_wav)       # (B, T_frames, D_enc)
+            if use_raw:
+                # Use raw encoder features (768-dim for BEATs/WavLM)
+                embedding = noise_emb.mean(dim=1)             # (B, D_enc)
+            else:
+                noise_emb = noise_emb.transpose(1, 2).contiguous()  # (B, D_enc, T_frames)
+                noise_emb = self.post_cnn(noise_emb)               # (B, 256, T_frames)
+                embedding = noise_emb.mean(dim=-1)                  # (B, 256)
+            # L2 normalize — critical for meaningful distances
+            embedding = torch.nn.functional.normalize(embedding, p=2, dim=-1)
         return embedding
 
-    def compute_embedding_distance(self, y_wav, ref_embeddings, k=10, tau=1.0):
+    def compute_embedding_distance(self, y_wav, ref_embeddings, k=10, tau=1.0, use_raw=False):
         """k-NN distance based adaptive guidance scale.
 
         Args:
             y_wav: (B, 1, T) noisy waveform
-            ref_embeddings: (N_ref, 256) reference embeddings from training data
+            ref_embeddings: (N_ref, D) L2-normalized reference embeddings
             k: number of nearest neighbors
             tau: temperature for distance-to-weight mapping
         Returns:
-            distance: (B,) mean k-NN distance
-            w: (B,) guidance scale = 1 / (1 + dist/tau)
+            distance: (B,) mean k-NN distance (cosine-like, in [0, 2])
+            w: (B,) guidance scale in [-1, 1]
         """
-        embedding = self.extract_noise_embedding(y_wav)          # (B, 256)
+        embedding = self.extract_noise_embedding(y_wav, use_raw=use_raw)
         distances = torch.cdist(embedding, ref_embeddings)       # (B, N_ref)
         knn_dist, _ = torch.topk(distances, k, largest=False, dim=-1)  # (B, k)
         distance = knn_dist.mean(dim=-1)                         # (B,)
-        w = 1.0 / (1.0 + distance / tau)                         # (B,)
+        # Map: dist=0 → w=1 (boost cond), dist=τ → w=0, dist→∞ → w=-1 (uncond)
+        w = 2.0 / (1.0 + distance / tau) - 1.0
         return distance, w
 
-    def compute_prototype_distance(self, y_wav, prototypes, tau=1.0):
+    def compute_prototype_distance(self, y_wav, prototypes, tau=1.0, use_raw=False):
         """Prototype distance based adaptive guidance scale.
-
-        Uses minimum distance to class prototypes (centroids of training embeddings).
 
         Args:
             y_wav: (B, 1, T) noisy waveform
-            prototypes: (N_classes, 256) class prototype embeddings
+            prototypes: (N_classes, D) L2-normalized prototype embeddings
             tau: temperature for distance-to-weight mapping
         Returns:
             distance: (B,) min distance to any prototype
-            w: (B,) guidance scale = 1 / (1 + dist/tau)
+            w: (B,) guidance scale in [-1, 1]
         """
-        embedding = self.extract_noise_embedding(y_wav)          # (B, 256)
+        embedding = self.extract_noise_embedding(y_wav, use_raw=use_raw)
         distances = torch.cdist(embedding, prototypes)           # (B, N_classes)
         distance = distances.min(dim=-1)[0]                      # (B,)
-        w = 1.0 / (1.0 + distance / tau)                         # (B,)
+        w = 2.0 / (1.0 + distance / tau) - 1.0
         return distance, w
 
     def forward_uncond(self, x, t, y):

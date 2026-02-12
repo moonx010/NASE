@@ -33,6 +33,7 @@ if __name__ == '__main__':
     parser.add_argument("--k_neighbors", type=int, default=10, help="k for k-NN distance (default=10)")
     parser.add_argument("--tau", type=float, default=1.0, help="Temperature for distance-to-w mapping (default=1.0)")
     parser.add_argument("--encoder_type", type=str, default="beats", choices=("beats", "wavlm", "panns"), help="Noise encoder type (must match training)")
+    parser.add_argument("--use_raw", action='store_true', help="Use raw encoder features for distance (768-dim) instead of post_cnn (256-dim)")
     args = parser.parse_args()
 
     noisy_dir = join(args.test_dir, args.test_set)
@@ -116,14 +117,16 @@ if __name__ == '__main__':
             elif args.distance_method == "knn":
                 # k-NN distance based
                 distance, w_tensor = model.compute_embedding_distance(
-                    y_wav.cuda(), ref_embeddings, k=args.k_neighbors, tau=args.tau)
+                    y_wav.cuda(), ref_embeddings, k=args.k_neighbors, tau=args.tau,
+                    use_raw=args.use_raw)
                 dist_val = distance.item()
                 w = w_tensor.item() * args.w_max
                 guidance_log.append({"filename": filename, "confidence": 0.0, "pred_class": -1, "distance": round(dist_val, 4), "w": round(w, 4)})
             elif args.distance_method == "prototype":
                 # Prototype distance based
                 distance, w_tensor = model.compute_prototype_distance(
-                    y_wav.cuda(), ref_embeddings, tau=args.tau)
+                    y_wav.cuda(), ref_embeddings, tau=args.tau,
+                    use_raw=args.use_raw)
                 dist_val = distance.item()
                 w = w_tensor.item() * args.w_max
                 guidance_log.append({"filename": filename, "confidence": 0.0, "pred_class": -1, "distance": round(dist_val, 4), "w": round(w, 4)})
