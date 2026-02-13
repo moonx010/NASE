@@ -70,10 +70,10 @@ def main():
             # Forward through noise encoder
             noise_emb, nc_logits, _ = model.noise_encoder(y_wav)
 
-            # NC logits: (1, T, 10) -> mean over time -> (1, 10)
-            logits_mean = nc_logits.mean(dim=1)
-            pred = torch.argmax(logits_mean, dim=1).item()
-            conf = torch.softmax(logits_mean, dim=-1).max().item()
+            # BEATs returns (B, 10) already mean-pooled + sigmoid'd
+            # Use sigmoid values directly (do NOT apply softmax on top)
+            pred = torch.argmax(nc_logits, dim=-1).item()
+            conf = nc_logits.max(dim=-1)[0].item()
 
             confidences.append(conf)
             per_class_total[label_str] += 1

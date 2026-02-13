@@ -359,14 +359,19 @@ class ScoreModel(pl.LightningModule):
     def compute_nc_confidence(self, y_wav):
         """Compute NC classifier confidence for adaptive guidance.
 
+        Note: BEATs already applies sigmoid to logits internally.
+        We use sigmoid outputs directly as confidence (max over classes),
+        NOT softmax(sigmoid(x)) which would flatten the distribution.
+
         Returns:
-            confidence: max softmax probability (scalar or batch)
-            logits: raw NC logits (for analysis)
+            confidence: max class probability (scalar or batch)
+            logits: NC logits after sigmoid (for analysis)
         """
         with torch.no_grad():
             _, logits, _ = self.noise_encoder(y_wav.squeeze(1))
-            probs = torch.softmax(logits, dim=-1)
-            confidence = probs.max(dim=-1)[0]
+            # logits are already sigmoid'd by BEATs (multi-label style)
+            # Use max sigmoid value as confidence (NOT softmax on top)
+            confidence = logits.max(dim=-1)[0]
         return confidence, logits
 
     def extract_noise_embedding(self, y_wav, use_raw=False):
