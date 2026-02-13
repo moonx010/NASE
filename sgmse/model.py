@@ -192,11 +192,13 @@ class ScoreModel(pl.LightningModule):
         acc = (pred == noise_label).sum() / noise_label.numel()
         # print(f'acc={round(float(acc), 3)}')
 
-        return loss
+        return loss, loss_class, acc
 
     def training_step(self, batch, batch_idx):
-        loss = self._step_train(batch, batch_idx)
+        loss, loss_class, acc = self._step_train(batch, batch_idx)
         self.log('train_loss', loss, on_step=True, on_epoch=True)
+        self.log('train_nc_loss', loss_class, on_step=True, on_epoch=True)
+        self.log('train_nc_acc', acc, on_step=True, on_epoch=True)
         return loss
 
     def forward_train(self, x, t, y, y_wav):
