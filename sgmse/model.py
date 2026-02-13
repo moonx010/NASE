@@ -184,7 +184,9 @@ class ScoreModel(pl.LightningModule):
         loss = self._loss(err)
 
         # classification loss
-        loss_class = self.classfication_loss(logits, noise_label)
+        # BEATs/WavLM/PANNs return sigmoid'd logits — reverse to raw logits for CE
+        raw_logits = torch.logit(logits.clamp(1e-6, 1 - 1e-6))
+        loss_class = self.classfication_loss(raw_logits, noise_label)
         loss = loss + loss_class * 0.3
 
         # classification accuracy
