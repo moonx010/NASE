@@ -90,6 +90,9 @@ class ScoreModel(pl.LightningModule):
         if self.inject_type == 'concat':
             self.proj = torch.nn.Linear(512, 256)
 
+        # Noise embedding scale for inference (1.0 = normal, 0.0 = no conditioning)
+        self.noise_scale = 1.0
+
         # Initialize SDE
         sde_cls = SDERegistry.get_by_name(sde)
         self.sde = sde_cls(**kwargs)
@@ -303,6 +306,7 @@ class ScoreModel(pl.LightningModule):
             ### 1. addition
             # (8, 1, 256, 1)
             noise_emb = self.post_cnn(noise_emb).mean(dim=-1).unsqueeze(1).unsqueeze(-1)
+            noise_emb = noise_emb * self.noise_scale  # adaptive scaling
             dnn_input = dnn_input + noise_emb
         elif self.inject_type == 'concat':
             ### 2. concat
