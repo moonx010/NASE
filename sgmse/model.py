@@ -148,7 +148,9 @@ class ScoreModel(pl.LightningModule):
         self.num_eval_files = num_eval_files
 
         self.save_hyperparameters(ignore=['no_wandb'])
-        self.data_module = data_module_cls(**kwargs, gpu=kwargs.get('gpus', 0) > 0)
+        self.data_module = data_module_cls(
+            **kwargs, gpu=kwargs.get('gpus', 0) > 0,
+            multi_degradation=multi_degradation)
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
