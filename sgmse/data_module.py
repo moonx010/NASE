@@ -1,5 +1,6 @@
 
 from os.path import join
+import csv
 import torch
 import pytorch_lightning as pl
 from torch.utils.data import Dataset
@@ -10,6 +11,9 @@ import numpy as np
 import torch.nn.functional as F
 
 noise2id = {'babble': 0, 'cafeteria': 1, 'car': 2, 'kitchen': 3, 'meeting': 4, 'metro': 5, 'restaurant': 6, 'ssn': 7, 'station': 8, 'traffic': 9}
+
+# Extended noise2id for multi-degradation (11 classes: 10 DEMAND + "none")
+noise2id_multi = {**noise2id, 'none': 10}
 
 def get_window(window_type, window_length):
     if window_type == 'sqrthann':
@@ -172,6 +176,99 @@ class Specs_noise_label(Dataset):
             return len(self.clean_files)
 
 
+class Specs_multi_label(Dataset):
+    """Dataset for multi-degradation training with CSV-based labels.
+
+    Returns (X, Y, y_wav, noise_label, reverb_label, distort_label) where:
+        noise_label: int (0-10, 11 classes) for CrossEntropyLoss
+        reverb_label: float (T60 value) for MSELoss
+        distort_label: float (intensity value) for MSELoss
+    """
+    def __init__(self, data_dir, subset, dummy, shuffle_spec, num_frames,
+            format='default', normalize="noisy", spec_transform=None,
+            stft_kwargs=None, **ignored_kwargs):
+
+        if format == "default":
+            self.clean_files = sorted(glob(join(data_dir, subset) + '/clean/*.wav'))
+            self.noisy_files = sorted(glob(join(data_dir, subset) + '/noisy/*.wav'))
+
+            # Read labels.csv
+            csv_path = join(data_dir, subset, 'labels.csv')
+            self.labels = {}  # filename -> {noise_type, snr, reverb_t60, distort_intensity}
+            with open(csv_path) as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    self.labels[row['filename']] = row
+        else:
+            raise NotImplementedError(f"Directory format {format} unknown!")
+
+        self.dummy = dummy
+        self.num_frames = num_frames
+        self.shuffle_spec = shuffle_spec
+        self.normalize = normalize
+        self.spec_transform = spec_transform
+
+        assert all(k in stft_kwargs.keys() for k in ["n_fft", "hop_length", "center", "window"]), "misconfigured STFT kwargs"
+        self.stft_kwargs = stft_kwargs
+        self.hop_length = self.stft_kwargs["hop_length"]
+        assert self.stft_kwargs.get("center", None) == True, "'center' must be True for current implementation"
+
+    def __getitem__(self, i):
+        x, _ = load(self.clean_files[i])
+        y, _ = load(self.noisy_files[i])
+
+        # Get labels from CSV
+        filename = self.noisy_files[i].split('/')[-1]
+        label_row = self.labels.get(filename, None)
+        if label_row is not None:
+            noise_type = label_row['noise_type']
+            noise_label = torch.tensor(noise2id_multi.get(noise_type, 10))
+            reverb_label = torch.tensor(float(label_row['reverb_t60']))
+            distort_label = torch.tensor(float(label_row['distort_intensity']))
+        else:
+            # Fallback: assume noise-only
+            noise_label = torch.tensor(0)
+            reverb_label = torch.tensor(0.0)
+            distort_label = torch.tensor(0.0)
+
+        # formula applies for center=True
+        target_len = (self.num_frames - 1) * self.hop_length
+        current_len = x.size(-1)
+        pad = max(target_len - current_len, 0)
+        if pad == 0:
+            if self.shuffle_spec:
+                start = int(np.random.uniform(0, current_len-target_len))
+            else:
+                start = int((current_len-target_len)/2)
+            x = x[..., start:start+target_len]
+            y = y[..., start:start+target_len]
+        else:
+            x = F.pad(x, (pad//2, pad//2+(pad%2)), mode='constant')
+            y = F.pad(y, (pad//2, pad//2+(pad%2)), mode='constant')
+
+        y_wav = y.clone()
+        if self.normalize == "noisy":
+            normfac = y.abs().max()
+        elif self.normalize == "clean":
+            normfac = x.abs().max()
+        elif self.normalize == "not":
+            normfac = 1.0
+        x = x / normfac
+        y = y / normfac
+
+        X = torch.stft(x, **self.stft_kwargs)
+        Y = torch.stft(y, **self.stft_kwargs)
+
+        X, Y = self.spec_transform(X), self.spec_transform(Y)
+        return X, Y, y_wav, noise_label, reverb_label, distort_label
+
+    def __len__(self):
+        if self.dummy:
+            return int(len(self.clean_files)/200)
+        else:
+            return len(self.clean_files)
+
+
 class SpecsDataModule(pl.LightningDataModule):
     @staticmethod
     def add_argparse_args(parser):
@@ -188,13 +285,15 @@ class SpecsDataModule(pl.LightningDataModule):
         parser.add_argument("--spec_abs_exponent", type=float, default=0.5, help="Exponent e for the transformation abs(z)**e * exp(1j*angle(z)). 0.5 by default.")
         parser.add_argument("--normalize", type=str, choices=("clean", "noisy", "not"), default="noisy", help="Normalize the input waveforms by the clean signal, the noisy signal, or not at all.")
         parser.add_argument("--transform_type", type=str, choices=("exponent", "log", "none"), default="exponent", help="Spectogram transformation for input representation.")
+        parser.add_argument("--multi_degradation", action="store_true", help="Use multi-degradation dataset with CSV labels")
         return parser
 
     def __init__(
         self, base_dir, format='default', batch_size=8,
         n_fft=510, hop_length=128, num_frames=256, window='hann',
         num_workers=4, dummy=False, spec_factor=0.15, spec_abs_exponent=0.5,
-        gpu=True, normalize='noisy', transform_type="exponent", **kwargs
+        gpu=True, normalize='noisy', transform_type="exponent",
+        multi_degradation=False, **kwargs
     ):
         super().__init__()
         self.base_dir = base_dir
@@ -212,6 +311,7 @@ class SpecsDataModule(pl.LightningDataModule):
         self.gpu = gpu
         self.normalize = normalize
         self.transform_type = transform_type
+        self.multi_degradation = multi_degradation
         self.kwargs = kwargs
 
     def setup(self, stage=None):
@@ -220,7 +320,11 @@ class SpecsDataModule(pl.LightningDataModule):
             spec_transform=self.spec_fwd, **self.kwargs
         )
         if stage == 'fit' or stage is None:
-            self.train_set = Specs_noise_label(data_dir=self.base_dir, subset='train',
+            if self.multi_degradation:
+                train_cls = Specs_multi_label
+            else:
+                train_cls = Specs_noise_label
+            self.train_set = train_cls(data_dir=self.base_dir, subset='train',
                 dummy=self.dummy, shuffle_spec=True, format=self.format,
                 normalize=self.normalize, **specs_kwargs)
             self.valid_set = Specs(data_dir=self.base_dir, subset='valid',

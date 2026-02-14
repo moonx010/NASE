@@ -73,41 +73,68 @@ class BEATsEncoder(nn.Module):
 
 @register_encoder("wavlm")
 class WavLMEncoder(nn.Module):
-    """WavLM Base encoder. embed_dim=768, with NC classification head."""
+    """WavLM Base encoder. embed_dim=768, with NC classification head.
+
+    When multi_degradation=True, adds reverb and distortion regression heads.
+    """
 
     embed_dim = 768
 
-    def __init__(self, pretrain_class_model: str = None, predictor_class: int = 10):
+    def __init__(self, pretrain_class_model: str = None, predictor_class: int = 10,
+                 multi_degradation: bool = False):
         super().__init__()
         # Load WavLM Base from torchaudio
         bundle = torchaudio.pipelines.WAVLM_BASE
         self.model = bundle.get_model()
         self.expected_sr = bundle.sample_rate  # 16000
+        self.multi_degradation = multi_degradation
 
         # NC classification head (same role as BEATs predictor)
         self.predictor_dropout = nn.Dropout(0.1)
-        self.predictor = nn.Linear(768, predictor_class)
+
+        if multi_degradation:
+            # 11-class noise classification (10 DEMAND + "none")
+            self.noise_head = nn.Linear(768, 11)
+            # Reverb T60 regression
+            self.reverb_head = nn.Sequential(
+                nn.Linear(768, 256), nn.ReLU(), nn.Linear(256, 1))
+            # Distortion intensity regression
+            self.distort_head = nn.Sequential(
+                nn.Linear(768, 256), nn.ReLU(), nn.Linear(256, 1))
+        else:
+            self.predictor = nn.Linear(768, predictor_class)
 
     def forward(self, source: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
         """
         Args:
             source: (B, T_samples) raw waveform at 16kHz
-        Returns:
+        Returns (multi_degradation=False):
             embedding: (B, T_frames, 768)
-            logits: (B, predictor_class) — mean-pooled + sigmoid (matches BEATs interface)
+            logits: (B, predictor_class) — sigmoid applied
             padding_mask: None
+        Returns (multi_degradation=True):
+            embedding: (B, T_frames, 768)
+            noise_logits: (B, 11) — sigmoid applied
+            padding_mask: None
+            reverb_pred: (B, 1) — T60 prediction
+            distort_pred: (B, 1) — distortion intensity prediction
         """
-        # WavLM expects (B, T) float waveform
-        # extract_features returns list of layer outputs; take last layer
         features, _ = self.model.extract_features(source)
         embedding = features[-1]  # (B, T_frames, 768)
 
         x = self.predictor_dropout(embedding)
-        logits = self.predictor(x)  # (B, T_frames, predictor_class)
-        logits = logits.mean(dim=1)  # (B, predictor_class)
-        logits = torch.sigmoid(logits)
+        pooled = x.mean(dim=1)  # (B, 768)
 
-        return embedding, logits, None
+        if self.multi_degradation:
+            noise_logits = torch.sigmoid(self.noise_head(pooled))  # (B, 11)
+            reverb_pred = torch.sigmoid(self.reverb_head(pooled))  # (B, 1) — clamp to [0,1]
+            distort_pred = torch.sigmoid(self.distort_head(pooled))  # (B, 1)
+            return embedding, noise_logits, None, reverb_pred, distort_pred
+        else:
+            logits = self.predictor(x)  # (B, T_frames, predictor_class)
+            logits = logits.mean(dim=1)  # (B, predictor_class)
+            logits = torch.sigmoid(logits)
+            return embedding, logits, None
 
 
 # ──────────────────────────────────────────────

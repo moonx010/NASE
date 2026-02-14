@@ -37,6 +37,11 @@ if __name__ == '__main__':
     parser.add_argument("--adaptive_scaling", action='store_true', help="Enable distance-based adaptive noise embedding scaling (no CFG)")
     parser.add_argument("--scaling_method", type=str, default="knn", choices=("knn", "prototype"), help="Distance method for adaptive scaling")
     parser.add_argument("--encoder_type", type=str, default="beats", choices=("beats", "wavlm", "panns"), help="Noise encoder type (must match training)")
+    # Multi-degradation adaptive args
+    parser.add_argument("--multi_degradation", action='store_true', help="Enable multi-degradation adaptive inference")
+    parser.add_argument("--static_noise_w", type=float, default=None, help="Static noise branch weight (overrides adaptive)")
+    parser.add_argument("--static_reverb_w", type=float, default=None, help="Static reverb branch weight (overrides adaptive)")
+    parser.add_argument("--static_distort_w", type=float, default=None, help="Static distortion branch weight (overrides adaptive)")
     args = parser.parse_args()
 
     noisy_dir = join(args.test_dir, args.test_set)
@@ -54,14 +59,17 @@ if __name__ == '__main__':
     corrector_steps = args.corrector_steps
 
     # Load score model
-    model = ScoreModel.load_from_checkpoint(
-        checkpoint_file,
+    load_kwargs = dict(
         base_dir='',
         batch_size=16,
         num_workers=0,
         pretrain_class_model=pretrain_class_model,
         encoder_type=args.encoder_type,
-        kwargs=dict(gpu=False))
+        kwargs=dict(gpu=False),
+    )
+    if args.multi_degradation:
+        load_kwargs['multi_degradation'] = True
+    model = ScoreModel.load_from_checkpoint(checkpoint_file, **load_kwargs)
     model.eval(no_ema=False)
     model.cuda()
 
@@ -77,7 +85,12 @@ if __name__ == '__main__':
         print(f"Loaded reference embeddings: {args.ref_embeddings} — shape {ref_embeddings.shape}")
 
     # Determine mode
-    if args.noise_scale is not None:
+    if args.multi_degradation:
+        if args.static_noise_w is not None:
+            mode = f"Multi-deg static (n={args.static_noise_w}, r={args.static_reverb_w}, d={args.static_distort_w})"
+        else:
+            mode = "Multi-deg adaptive"
+    elif args.noise_scale is not None:
         mode = f"Static noise_scale={args.noise_scale:.2f}"
     elif args.adaptive_scaling:
         mode = f"Adaptive scaling ({args.scaling_method}, tau={args.tau})"
@@ -109,8 +122,33 @@ if __name__ == '__main__':
         Y = torch.unsqueeze(model._forward_transform(model._stft(y.cuda())), 0)
         Y = pad_spec(Y)
 
+        # --- Multi-degradation adaptive mode ---
+        multi_weights = None
+        if args.multi_degradation:
+            if args.static_noise_w is not None:
+                # Static per-branch weights
+                noise_w = args.static_noise_w
+                reverb_w = args.static_reverb_w if args.static_reverb_w is not None else 1.0
+                distort_w = args.static_distort_w if args.static_distort_w is not None else 1.0
+                info = {"noise_w": noise_w, "reverb_w": reverb_w, "distort_w": distort_w}
+            else:
+                # Adaptive per-branch weights from encoder predictions
+                noise_w, reverb_w, distort_w, info = model.compute_multi_adaptive_weights(
+                    y_wav.cuda())
+            multi_weights = (noise_w, reverb_w, distort_w)
+            gs = None  # no legacy CFG
+            guidance_log.append({
+                "filename": filename,
+                "distance": 0.0,
+                "alpha": 1.0,
+                "w": 0.0,
+                "noise_w": round(noise_w, 4),
+                "reverb_w": round(reverb_w, 4),
+                "distort_w": round(distort_w, 4),
+            })
+
         # --- Embedding Scaling mode (new) ---
-        if args.noise_scale is not None:
+        elif args.noise_scale is not None:
             # Static noise scale
             model.noise_scale = args.noise_scale
             gs = None  # no CFG
@@ -168,7 +206,8 @@ if __name__ == '__main__':
         sampler = model.get_pc_sampler(
             'reverse_diffusion', corrector_cls, Y.cuda(), y_wav.cuda(), N=N,
             corrector_steps=corrector_steps, snr=snr,
-            guidance_scale=gs)
+            guidance_scale=gs,
+            multi_adaptive_weights=multi_weights)
         sample, _ = sampler()
 
         # Backward transform in time domain
@@ -183,12 +222,23 @@ if __name__ == '__main__':
     # Save log
     if guidance_log:
         log_path = join(target_dir, "_guidance_log.csv")
-        fieldnames = ["filename", "distance", "alpha", "w"]
+        if args.multi_degradation:
+            fieldnames = ["filename", "distance", "alpha", "w", "noise_w", "reverb_w", "distort_w"]
+        else:
+            fieldnames = ["filename", "distance", "alpha", "w"]
         with open(log_path, 'w', newline='') as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(guidance_log)
-        if args.adaptive_scaling or args.noise_scale is not None:
+        if args.multi_degradation:
+            nws = [r["noise_w"] for r in guidance_log]
+            rws = [r["reverb_w"] for r in guidance_log]
+            dws = [r["distort_w"] for r in guidance_log]
+            print(f"\nMulti-degradation adaptive weights:")
+            print(f"  noise_w:   mean={sum(nws)/len(nws):.3f}, min={min(nws):.3f}, max={max(nws):.3f}")
+            print(f"  reverb_w:  mean={sum(rws)/len(rws):.3f}, min={min(rws):.3f}, max={max(rws):.3f}")
+            print(f"  distort_w: mean={sum(dws)/len(dws):.3f}, min={min(dws):.3f}, max={max(dws):.3f}")
+        elif args.adaptive_scaling or args.noise_scale is not None:
             alphas = [r["alpha"] for r in guidance_log]
             dists = [r["distance"] for r in guidance_log]
             print(f"\nEmbedding scaling stats:")

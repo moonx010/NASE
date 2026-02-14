@@ -1,313 +1,327 @@
-# NASE Fork Migration Guide
+# NASE: Multi-Degradation Adaptive Speech Enhancement
 
-> 이 문서는 기존 SGMSE 기반 실험에서 NASE fork로 migration하기 위한 모든 정보를 담고 있습니다.
-> Interspeech 2026 제출 목표 (D-18, 2/24 마감)
+> Interspeech 2026 제출 (D-10, 2/24 마감)
+> 기존 SGMSE→NASE migration 완료, Multi-Degradation Adaptive SE 구현 완료 (2/14)
 
 ---
 
-## 1. 연구 배경 및 목표
+## 1. 연구 개요
 
-### 1.1 Original Goal
-Noise-conditioned speech enhancement with CFG (Classifier-Free Guidance)를 통해 OOD (Out-of-Distribution) noise에서도 robust하게 동작하는 모델 개발.
+### 1.1 한줄 요약
+Diffusion 기반 SE에서 noise/reverb/distortion 복합 degradation을 각각 독립적으로 conditioning하고,
+encoder prediction confidence 기반으로 per-degradation adaptive guidance를 수행하는 모델.
 
-### 1.2 Research Pivot (2026-02-05)
-기존 scratch CNN encoder + CFG 접근이 실패하여, **NASE 기반 + Uncertainty-aware Adaptive Guidance**로 방향 전환.
+### 1.2 연구 진화 경로
+```
+Phase 0 (2/6): SGMSE + CNN encoder + CFG → 실패 (48kHz 문제 + shallow injection)
+Phase 1 (2/7): NASE fork + BEATs + input addition → CFG 무효 확인
+Phase 2 (2/14): WavLM + 3 heads + temb injection + per-degradation adaptive → 현재
+```
 
 ### 1.3 핵심 아이디어
 ```
-기존 NASE의 한계: OOD noise에서 misleading conditioning → 성능 하락
-우리의 해결책: NC classifier confidence 또는 embedding distance로
-             conditioning reliability를 추정하고, guidance scale w를 자동 조절
+문제:
+  1. Input addition은 shallow (1 injection point) → CFG 작동 안 함
+  2. Single degradation conditioning → 복합 환경에서 부정확
+  3. OOD 상황에서 blind conditioning → 성능 악화
+
+해결:
+  1. temb injection → ~37개 ResBlock 전체에 deep conditioning
+  2. 3-branch encoding (noise/reverb/distortion) → per-degradation 독립 제어
+  3. Encoder prediction confidence → adaptive weight 자동 조절
 ```
 
 ---
 
-## 2. 기존 실험 결과 요약
+## 2. Architecture
 
-### 2.1 성능 문제 발견
-
-| Model | In-dist PESQ | In-dist SI-SDR | OOD PESQ | OOD SI-SDR |
-|-------|--------------|----------------|----------|------------|
-| **Paper pretrained** | **2.91** | **17.0** | - | - |
-| Our SGMSE (N=50) | 1.84 | 12.9 | 1.19 | -1.3 |
-| Our CFG p=0.2 (N=50) | 1.76 | 11.7 | 1.16 | -0.7 |
-
-### 2.2 원인 분석
-
-#### ❌ 학습 실패 원인: **48kHz vs 16kHz 문제**
+### 2.1 전체 구조
 ```
-- VoiceBank-DEMAND 데이터: 48kHz
-- SGMSE STFT 파라미터: 16kHz용 (n_fft=510, hop_length=128)
-- Training data_module.py: 리샘플링 없음!
-- Inference enhancement.py: 16kHz로 리샘플링함
-
-→ Training은 잘못된 spectrogram으로 학습, Inference는 정상
-→ Paper pretrained는 16kHz 데이터로 학습되어 정상 작동
+noisy_wav → WavLM Encoder → (B, T, 768)
+                │
+                ├─→ noise_head(768→11)  → 11-class CE loss
+                ├─→ reverb_head(768→256→1) → T60 MSE loss
+                └─→ distort_head(768→256→1) → intensity MSE loss
+                │
+                └─→ post_cnn(768→256) → mean pool → (B, 256)
+                     │
+                     ├─→ noise_proj(256→128)  × dropout_mask
+                     ├─→ reverb_proj(256→128)  × dropout_mask
+                     └─→ distort_proj(256→128) × dropout_mask
+                          │
+                          concat → (B, 384) → cond_to_temb(384→512→512)
+                                                    │
+STFT(noisy) → ncsnpp backbone ← temb(timestep) + extra_cond(degradation)
+     │                              ↑ 모든 ~37 ResBlock에 주입
+     └─→ ISTFT → enhanced speech
 ```
 
-#### ❌ 기존 CNN Encoder 문제 (NASE 비교 분석)
-| 요소 | NASE (잘 동작) | 우리 기존 (문제) |
-|------|----------------|------------------|
-| Noise Encoder | Pre-trained BEATs (768-dim) | 4-layer CNN from scratch (512-dim) |
-| Encoder Supervision | NC loss (classification) | 없음 |
-| Injection 방식 | Input addition | FiLM via time embedding |
-| CFG | 없음 | p=0.2 dropout |
+### 2.2 핵심 모듈 위치
 
-### 2.3 Training 설정 비교 (참고용)
-| 항목 | Paper | 우리 |
-|------|-------|------|
-| Epochs/Steps | 160 epochs ≈ 58k steps | 58k steps ✅ |
-| Batch | 4 GPU × 8 = 32 | 4 GPU × 8 = 32 ✅ |
-| Learning rate | 1e-4 | 1e-4 ✅ |
-| EMA decay | 0.999 | 0.999 ✅ |
-| Backbone | ncsnpp | ncsnpp ✅ |
-| **Data SR** | **16kHz** | **48kHz** ❌ |
+| Module | File | Line(approx) |
+|--------|------|------|
+| WavLMEncoder (3 heads) | `sgmse/encoders.py` | WavLMEncoder class |
+| 3-branch projection | `sgmse/model.py` | ScoreModel.__init__ |
+| forward_train_multi | `sgmse/model.py` | forward_train_multi() |
+| temb injection | `sgmse/backbones/ncsnpp.py:290` | `temb = temb + extra_cond` |
+| Multi-task loss | `sgmse/model.py` | _step_train_multi() |
+| Adaptive inference | `sgmse/model.py` | forward_multi_adaptive() |
+| Specs_multi_label | `sgmse/data_module.py` | CSV-based multi-label dataset |
+| Data generation | `preprocessing/create_multi_degradation.py` | 복합 degradation 생성 |
+
+### 2.3 Injection Method 비교
+
+| 방법 | Injection Points | CFG 가능 | 구현 |
+|------|-----------------|---------|------|
+| Input addition (NASE) | 1 | X (실험 확인) | 기존 코드 |
+| Cross-attention | 1 | △ (미검증) | 기존 코드 |
+| **temb injection (Ours)** | **~37** | **O** | **ncsnpp 1줄** |
+| AdaLN-Zero (DiTSE) | 전체 layer | O (검증됨) | backbone 교체 필요 |
 
 ---
 
-## 3. 새로운 연구 방향: Uncertainty-aware Adaptive Guidance
+## 3. 코드 구조
 
-### 3.1 Motivation
-2025년 CFG 연구 트렌드: static guidance scale → adaptive/dynamic guidance
+### 3.1 주요 파일
 
-| Paper | Method | 우리와의 차이 |
-|-------|--------|--------------|
-| β-CFG (Feb 2025) | Timestep 기반 β-distribution | OOD 미고려 |
-| Prompt-aware CFG (Sep 2025) | Prompt 복잡도 기반 | Noise embedding 특화 아님 |
-| Feedback Guidance (Jun 2025) | Trajectory quality 자가평가 | 별도 evaluator 필요 |
-| Dynamic CFG (Sep 2025) | Greedy search per timestep | Computational overhead |
-| **Ours** | **Uncertainty 기반 (NC confidence / embedding distance)** | **OOD-aware, SE 특화** |
-
-### 3.2 Proposed Method
-
-```python
-# Option 1: NC Confidence 기반
-confidence = softmax(nc_logits).max()
-w = confidence  # confident → w=1 (trust conditioning), uncertain → w→0 (fallback)
-
-# Option 2: Embedding Distance 기반
-dist = knn_distance(noise_emb, train_embeddings, k=10)
-w = 1 / (1 + dist / tau)  # 가까우면 w→1, 멀면 w→0
-
-# Option 3: Combined
-w = alpha * confidence + (1-alpha) * (1 / (1 + dist/tau))
+```
+NASE/
+├── train.py                  # 학습 진입점
+├── enhancement.py            # 추론/평가 진입점
+├── calc_metrics.py           # PESQ, ESTOI, SI-SDR 계산
+├── sgmse/
+│   ├── model.py              # ScoreModel (핵심: 3-branch, multi-task loss)
+│   ├── encoders.py           # BEATs/WavLM/PANNs encoder
+│   ├── data_module.py        # Dataset classes (Specs, Specs_noise_label, Specs_multi_label)
+│   ├── backbones/
+│   │   └── ncsnpp.py         # U-Net backbone (temb injection 여기)
+│   ├── sampling.py           # PC sampler
+│   ├── sdes.py               # SDE definitions
+│   └── BEATs.py              # BEATs model
+├── preprocessing/
+│   ├── create_multi_degradation.py  # 복합 degradation 데이터 생성
+│   ├── create_ood_test.py           # OOD 테스트 생성
+│   └── resample_to_16k.py          # 48kHz→16kHz
+└── scripts/
+    └── eval_batch.py          # 배치 평가
 ```
 
-### 3.3 Updated Contributions
+### 3.2 핵심 Flag
 
-1. **Uncertainty-aware Adaptive Guidance**
-   - NC classifier confidence나 embedding distance 기반으로 conditioning reliability 추정
-   - Guidance scale w를 자동 조절 (수동 설정 불필요)
+| Flag | 위치 | 설명 |
+|------|------|------|
+| `--multi_degradation` | SpecsDataModule | 3-head + temb injection 모드 활성화 |
+| `--encoder_type wavlm` | train.py / enhancement.py | WavLM encoder 사용 (multi_deg 필수) |
+| `--p_uncond 0.1` | ScoreModel | Per-branch dropout 확률 |
+| `--static_noise_w` | enhancement.py | 정적 noise branch weight |
+| `--static_reverb_w` | enhancement.py | 정적 reverb branch weight |
+| `--static_distort_w` | enhancement.py | 정적 distort branch weight |
 
-2. **OOD-Robust Speech Enhancement**
-   - 별도의 OOD detector 없이, noise encoder의 uncertainty만으로 OOD 감지
-   - Graceful degradation: OOD에서 자동으로 unconditional로 fallback
+### 3.3 학습 명령어 템플릿
+
+```bash
+python train.py --backbone ncsnpp --sde ouve \
+    --encoder_type wavlm --multi_degradation \
+    --pretrain_class_model dummy \
+    --base_dir /path/to/multi_degradation_16k \
+    --gpus 4 --batch_size 4 --p_uncond 0.1 \
+    --wandb_name multi-deg-wavlm-v1 \
+    --max_epochs 160
+```
+
+### 3.4 평가 명령어 템플릿
+
+```bash
+# Baseline (no adaptation)
+python enhancement.py --multi_degradation \
+    --ckpt checkpoint.ckpt --pretrain_class_model dummy \
+    --encoder_type wavlm \
+    --test_dir test_dir --enhanced_dir enhanced/baseline \
+    --N 50
+
+# Adaptive (per-degradation automatic)
+python enhancement.py --multi_degradation \
+    --ckpt checkpoint.ckpt --pretrain_class_model dummy \
+    --encoder_type wavlm \
+    --test_dir test_dir --enhanced_dir enhanced/adaptive \
+    --N 50
+# (multi_degradation 모드에서는 기본적으로 w=1.0 전체 사용)
+
+# Static ablation
+python enhancement.py --multi_degradation \
+    --static_noise_w 1.0 --static_reverb_w 0.0 --static_distort_w 0.0 \
+    --ckpt checkpoint.ckpt --pretrain_class_model dummy \
+    --encoder_type wavlm \
+    --test_dir test_dir --enhanced_dir enhanced/noise-only \
+    --N 50
+```
+
+---
+
+## 4. 데이터
+
+### 4.1 Training Data
+
+| Dataset | Purpose | Size | Format |
+|---------|---------|------|--------|
+| VoiceBank-DEMAND 16kHz | 기존 noise-only | 11,572 train | clean/ + noisy/ + noise_label.txt |
+| Multi-Degradation 16kHz | 복합 degradation | ~30,000 train | clean/ + noisy/ + labels.csv |
+
+### 4.2 labels.csv Format
+```csv
+filename,noise_type,snr,reverb_t60,distort_intensity
+p236_002_n.wav,babble,15.0,0.0,0.0
+p236_002_nr.wav,babble,10.0,0.65,0.0
+p236_002_nrd.wav,cafeteria,5.0,0.8,0.7
+p236_003_r.wav,none,0.0,0.55,0.0
+p236_003_d.wav,none,0.0,0.0,0.6
+```
+
+### 4.3 Noise Classes (11)
+```
+0:babble, 1:cafeteria, 2:car, 3:kitchen, 4:meeting,
+5:metro, 6:restaurant, 7:ssn, 8:station, 9:traffic, 10:none
+```
+
+### 4.4 Degradation Combinations
+| Suffix | Combination | Fields |
+|--------|-------------|--------|
+| `_n` | noise only | noise_type, snr |
+| `_r` | reverb only | reverb_t60 |
+| `_d` | distort only | distort_intensity |
+| `_nr` | noise + reverb | noise_type, snr, reverb_t60 |
+| `_nd` | noise + distort | noise_type, snr, distort_intensity |
+| `_nrd` | noise + reverb + distort | all |
+
+---
+
+## 5. 기존 실험 결과 요약
+
+### 5.1 Phase 0: NASE Baseline
+
+| Model | In-dist PESQ | In-dist SI-SDR | OOD PESQ |
+|-------|-------------|----------------|----------|
+| Paper pretrained | 2.91 | 17.0 | - |
+| Our retrain (48kHz, 버그) | 1.84 | 12.9 | 1.19 |
+| Our + CFG p=0.2 | 1.76 | 11.7 | 1.16 |
+
+**핵심 발견:**
+1. 48kHz 데이터 사용이 학습 실패 원인 (해결됨: 16kHz)
+2. Input addition에서 CFG 무효 (해결됨: temb injection)
+
+### 5.2 Phase 1: Adaptive Guidance (Single-Degradation)
+- Embedding scaling (alpha sweep): 진행 중
+- Confidence-based scaling: 구현 완료, 평가 필요
+
+### 5.3 Phase 2: Multi-Degradation (Current)
+- 코드 구현 완료 (2/14)
+- 데이터 생성 → 학습 → 평가 순서로 진행 예정
+
+---
+
+## 6. 실험 계획
+
+> 상세 계획: `memory/research_plan.md`
+> 실험 로그: `memory/experiment_log.md`
+
+### 6.1 필수 실험 (P0)
+
+| ID | Experiment | Status |
+|----|-----------|--------|
+| E2-0 | Multi-deg 데이터 생성 | 코드 완료 |
+| E2-1 | WavLM + multi-deg 학습 | 코드 완료, 실행 필요 |
+| E2-2 | In-dist 평가 | 대기 |
+| E2-5 | OOD 평가 | 대기 |
+| E7 | Main comparison table | 대기 |
+
+### 6.2 선택 실험 (P1, 시간 여유시)
+
+| ID | Experiment | Purpose |
+|----|-----------|---------|
+| E3 | Injection method ablation | temb vs input addition |
+| E4 | Adaptive method ablation | per-branch vs global |
+| E5 | Cross-degradation analysis | Per-branch weight 시각화 |
+
+### 6.3 Metrics
+- PESQ, ESTOI, SI-SDR (speech quality)
+- NC Accuracy (학습 모니터링)
+- Per-branch weight distribution (해석 가능성)
+
+---
+
+## 7. Contributions (논문용)
+
+1. **Multi-Degradation Conditioning via temb Injection**
+   - 3-branch (noise/reverb/distortion) encoding
+   - Timestep embedding injection → ~37 ResBlock 전체에 deep conditioning
+
+2. **Per-Degradation Adaptive Guidance**
+   - 각 head의 prediction confidence → per-branch weight
+   - OOD 자동 감지 + graceful degradation
 
 3. **Empirical Analysis**
-   - 언제 noise conditioning이 도움/해가 되는지 분석
-   - Uncertainty-performance correlation 분석
-
-### 3.4 DiTSE와의 차별화
-| | DiTSE (2025) | Ours |
-|---|-------------|------|
-| CFG 대상 | 모든 conditioning (WavLM 등) | Noise embedding만 |
-| CFG 목적 | "conditioning을 더 잘 활용" | "OOD에서 graceful degradation" |
-| Guidance scale | 학습 후 고정 | Inference-time adaptive |
-| OOD 고려 | ❌ 없음 | ✅ 핵심 contribution |
+   - Cross-degradation evaluation
+   - Per-branch weight distribution analysis
 
 ---
 
-## 4. 실험 계획
+## 8. 서버 & 환경
 
-### 4.1 필수 실험
+| Item | Value |
+|------|-------|
+| Server 1 | 159-145 (8x RTX 3090) |
+| Server 2 | 159-67 (7x RTX 3090) |
+| NAS | `/home/nas4_user/kyudanjung/seokhoonmoon/` |
+| Conda env | `sgmse` (torch 2.8.0+cu128, PL 2.5.5) |
+| Data (16kHz) | NAS 또는 서버 로컬 |
+| BEATs ckpt | NAS |
+| GitHub | `git@github.com:moonx010/NASE.git` |
 
-| Exp | Purpose | Method |
-|-----|---------|--------|
-| **E1** | NASE baseline 재현 | BEATs + NC loss, p=0 |
-| **E2** | Adaptive guidance 효과 | Static w vs Adaptive w 비교 |
-| **E3** | Uncertainty correlation | NC confidence / embedding distance 분석 |
-| **E4** | Main comparison | SGMSE+ vs NASE vs Ours |
-
-### 4.2 Dataset
-
-**Training**: VoiceBank-DEMAND (⚠️ 반드시 16kHz로 리샘플링!)
-```bash
-python preprocessing/resample_to_16k.py \
-    --input_dir ./data/voicebank-demand \
-    --output_dir ./data/voicebank-demand-16k
-```
-
-**In-distribution Test**: VoiceBank-DEMAND test (824 files)
-
-**OOD Test**:
-- ESC-50 noise + clean speech @ 0dB SNR
-- UrbanSound8K (추가 예정)
-
-### 4.3 Evaluation Metrics
-- PESQ (Perceptual Evaluation of Speech Quality)
-- ESTOI (Extended Short-Time Objective Intelligibility)
-- SI-SDR (Scale-Invariant Signal-to-Distortion Ratio)
+### 주의사항
+- 데이터는 반드시 **16kHz** (48kHz 사용 금지!)
+- RTX 3090: batch_size=4 max (WavLM + multi-deg는 더 작을 수 있음)
+- tmux에서 항상 `conda activate sgmse`
+- PL 2.x: `Trainer.add_argparse_args`, `from_argparse_args` 없음
+- `--multi_degradation`은 `SpecsDataModule.add_argparse_args`에서만 등록
 
 ---
 
-## 5. NASE Repository 참고사항
+## 9. 참고 논문
 
-### 5.1 NASE 핵심 구조
-```
-NASE GitHub: https://github.com/YUCHEN005/NASE
-Paper: https://arxiv.org/abs/2307.08029
-```
+### Core
+| Paper | Venue | Key |
+|-------|-------|-----|
+| SGMSE+ | TASLP 2023 | Diffusion SE baseline |
+| NASE | Interspeech 2023 | Noise-aware conditioning |
+| NADiffuSE | ASRU 2023 | Noise-aware diffusion |
+| DiTSE | arXiv 2025 | DiT + AdaLN-Zero + CFG |
+| BEATs | ICML 2023 | Audio SSL encoder |
+| WavLM | JSTSP 2022 | Speech SSL encoder |
 
-**NASE 주요 컴포넌트:**
-- BEATs encoder (pretrained, 768-dim)
-- NC loss (Noise Classification loss for encoder supervision)
-- Input addition (noise embedding을 첫 layer feature에 더함)
-- SGMSE+ backbone (ncsnpp 기반)
-
-### 5.2 BEATs Checkpoint
-```
-BEATs Paper: https://arxiv.org/abs/2212.09058
-Checkpoint: https://github.com/microsoft/unilm/tree/master/beats
-```
-
-### 5.3 NASE에 추가해야 할 것
-1. **CFG Training**: `p_uncond` 확률로 noise embedding dropout
-2. **Adaptive Guidance**: NC head confidence 기반 w 계산
-3. **OOD Evaluation**: ESC-50, UrbanSound8K 테스트 파이프라인
+### Adaptive CFG
+| Paper | Key |
+|-------|-----|
+| beta-CFG (2025) | Timestep-based beta |
+| Prompt-aware CFG (2025) | Prompt complexity |
+| Dynamic CFG (2025) | Per-timestep search |
 
 ---
 
-## 6. 기존 코드 중 재사용 가능한 것
+## 10. Timeline (D-10)
 
-### 6.1 Evaluation Scripts
-```
-calc_metrics.py          # PESQ, ESTOI, SI-SDR 계산
-scripts/eval_batch.py    # Batch evaluation
-```
-
-### 6.2 Data Preprocessing
-```
-preprocessing/resample_to_16k.py   # 48kHz → 16kHz 변환
-preprocessing/create_ood_test.py   # OOD test mixture 생성 (있다면)
-```
-
-### 6.3 Visualization
-```
-visualization/visualize_eval_results.py  # 결과 시각화
-```
-
-### 6.4 Adaptive Guidance 구현 (새로 작성 필요)
-```python
-# model에 추가할 메서드
-def compute_adaptive_w(self, noise_emb, nc_logits):
-    """Compute adaptive guidance scale based on uncertainty."""
-    # NC confidence
-    confidence = F.softmax(nc_logits, dim=-1).max(dim=-1)[0]
-
-    # w = confidence (simple version)
-    # 또는 embedding distance 기반으로 확장
-    return confidence
-
-def enhance_with_adaptive_w(self, y, noise_ref, N=50):
-    """Enhancement with adaptive guidance scale."""
-    # 1. Extract noise embedding
-    noise_emb, nc_logits = self.noise_encoder(noise_ref)
-
-    # 2. Compute adaptive w
-    w = self.compute_adaptive_w(noise_emb, nc_logits)
-
-    # 3. Run CFG sampling with adaptive w
-    # ...
-```
-
----
-
-## 7. 참고 논문 및 링크
-
-### 7.1 Core Papers
-| Paper | Venue | Link |
-|-------|-------|------|
-| SGMSE+ | TASLP 2023 | https://arxiv.org/abs/2203.17024 |
-| NASE | Interspeech 2023 | https://arxiv.org/abs/2307.08029 |
-| NADiffuSE | ASRU 2023 | https://arxiv.org/abs/2309.01212 |
-| DiTSE | arXiv 2025 | https://arxiv.org/abs/2504.09381 |
-| BEATs | ICML 2023 | https://arxiv.org/abs/2212.09058 |
-
-### 7.2 CFG Improvements (2025)
-| Paper | Link |
-|-------|------|
-| β-CFG | https://arxiv.org/abs/2502.10574 |
-| Prompt-aware CFG | https://arxiv.org/abs/2509.22728 |
-| Feedback Guidance | https://arxiv.org/abs/2506.06085 |
-| Dynamic CFG | https://arxiv.org/abs/2509.16131 |
-
-### 7.3 Repositories
-| Repo | Link |
+| Date | Task |
 |------|------|
-| SGMSE | https://github.com/sp-uhh/sgmse |
-| NASE | https://github.com/YUCHEN005/NASE |
-| BEATs | https://github.com/microsoft/unilm/tree/master/beats |
+| 2/14 | 코드 구현 완료 ✅ |
+| 2/15 | 데이터 생성 + 학습 시작 |
+| 2/16-18 | 학습 (160ep) |
+| 2/18 | 중간 eval (40ep ckpt) |
+| 2/19 | Full eval (E2, E6) |
+| 2/20 | Ablation (시간 여유시) |
+| 2/21-22 | 논문 작성 |
+| 2/23 | Final review |
+| 2/24 | **Interspeech 제출** |
 
 ---
 
-## 8. 일정 (D-18, 2/24 제출)
-
-### Week 1 (2/6-2/12)
-- [ ] 2/6: 멘토님 미팅, 방향 확정
-- [ ] 2/6-2/7: NASE fork, 환경 설정
-- [ ] 2/7: **데이터 16kHz 리샘플링**
-- [ ] 2/8-2/10: NASE baseline 학습 (p=0)
-- [ ] 2/11-2/12: CFG 추가 (p=0.2) 학습
-
-### Week 2 (2/13-2/19)
-- [ ] 2/13-2/15: Main comparison 실험 (E1, E4)
-- [ ] 2/16-2/17: Adaptive guidance 구현 및 실험 (E2)
-- [ ] 2/18-2/19: Uncertainty analysis (E3)
-
-### Week 3 (2/20-2/24)
-- [ ] 2/20-2/22: 논문 작성 (Results, Discussion)
-- [ ] 2/23: Final review
-- [ ] 2/24: **제출**
-
----
-
-## 9. Checklist for NASE Fork
-
-### 9.1 환경 설정
-- [ ] NASE repository fork
-- [ ] Dependencies 설치
-- [ ] BEATs checkpoint 다운로드
-- [ ] VoiceBank-DEMAND 16kHz 변환
-
-### 9.2 코드 수정
-- [ ] CFG dropout 추가 (`p_uncond` 파라미터)
-- [ ] Adaptive guidance 구현 (NC confidence 기반)
-- [ ] OOD evaluation 파이프라인 추가
-- [ ] Visualization scripts 연동
-
-### 9.3 실험
-- [ ] NASE baseline 재현 (In-dist PESQ > 2.9 목표)
-- [ ] NASE의 OOD misleading 문제 확인
-- [ ] Adaptive guidance 효과 검증
-- [ ] Uncertainty-performance correlation 분석
-
----
-
-## 10. 멘토님 미팅 요약 (2026-02-06 예정)
-
-### 논의할 내용
-1. **48kHz 데이터 문제** - 이게 학습 실패의 핵심 원인
-2. **NASE fork로 재시작** - 기존 코드 버리고 새로 시작
-3. **Uncertainty-aware Adaptive Guidance** - Novelty 충분한지
-4. **일정 현실성** - 18일 안에 가능한지
-
-### 질문
-1. Adaptive guidance가 DiTSE 대비 충분한 novelty인가?
-2. 만약 가설이 틀리면 (adaptive가 효과 없으면) Plan B는?
-3. 최소 viable paper를 위한 필수 실험 우선순위는?
-
----
-
-*Created: 2026-02-06*
-*For migration from: sgmse (sp-uhh fork)*
-*To: NASE fork with Uncertainty-aware Adaptive Guidance*
+*Last updated: 2026-02-14*
+*Phase: Multi-Degradation Adaptive SE 구현 완료, 학습 대기*

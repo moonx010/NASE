@@ -254,7 +254,7 @@ class NCSNpp(nn.Module):
         parser.set_defaults(centered=True)
         return parser
 
-    def forward(self, x, time_cond):
+    def forward(self, x, time_cond, extra_cond=None):
         # timestep/noise_level embedding; only for continuous training
         modules = self.all_modules
         m_idx = 0
@@ -285,6 +285,10 @@ class NCSNpp(nn.Module):
             m_idx += 1
         else:
             temb = None
+
+        # Add extra conditioning (e.g. noise/reverb/distortion embedding)
+        if extra_cond is not None and temb is not None:
+            temb = temb + extra_cond
 
         if not self.centered:
             # If input data is in [0, 1]
