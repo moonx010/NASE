@@ -32,8 +32,14 @@ if __name__ == '__main__':
         filename = noisy_file.split('/')[-1]
         x, _ = read(join(clean_dir, filename))
         y, _ = read(noisy_file)
-        n = y - x 
         x_method, _ = read(join(enhanced_dir, filename))
+
+        # Truncate to same length (some models slightly change length)
+        min_len = min(len(x), len(x_method), len(y))
+        x = x[:min_len]
+        x_method = x_method[:min_len]
+        y = y[:min_len]
+        n = y - x
 
         data["filename"].append(filename)
         data["pesq"].append(pesq(sr, x, x_method, 'wb'))
