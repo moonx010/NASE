@@ -86,7 +86,9 @@ if __name__ == '__main__':
 
     # Determine mode
     if args.multi_degradation:
-        if args.static_noise_w is not None:
+        if args.guidance_scale is not None:
+            mode = f"Multi-deg CFG w={args.guidance_scale}"
+        elif args.static_noise_w is not None:
             mode = f"Multi-deg static (n={args.static_noise_w}, r={args.static_reverb_w}, d={args.static_distort_w})"
         else:
             mode = "Multi-deg adaptive"
@@ -125,7 +127,11 @@ if __name__ == '__main__':
         # --- Multi-degradation adaptive mode ---
         multi_weights = None
         if args.multi_degradation:
-            if args.static_noise_w is not None:
+            if args.guidance_scale is not None:
+                # Score-level CFG with multi_degradation model
+                gs = args.guidance_scale
+                multi_weights = None  # use CFGScoreWrapper instead
+            elif args.static_noise_w is not None:
                 # Static per-branch weights
                 noise_w = args.static_noise_w
                 reverb_w = args.static_reverb_w if args.static_reverb_w is not None else 1.0
