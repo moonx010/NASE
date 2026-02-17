@@ -61,6 +61,7 @@ class ScoreModel(pl.LightningModule):
         parser.add_argument("--num_eval_files", type=int, default=20, help="Number of files for speech enhancement performance evaluation during training. Pass 0 to turn off (no checkpoints based on evaluation metrics will be generated).")
         parser.add_argument("--loss_type", type=str, default="mse", choices=("mse", "mae"), help="The type of loss function to use.")
         parser.add_argument("--p_uncond", type=float, default=0.0, help="Probability of unconditional training for CFG (0.0 = baseline, no CFG)")
+        parser.add_argument("--aux_loss_weight", type=float, default=0.3, help="Weight for auxiliary multi-task losses (0.0 = no aux loss)")
         return parser
 
     def __init__(
@@ -68,7 +69,7 @@ class ScoreModel(pl.LightningModule):
         num_eval_files=20, loss_type='mse', data_module_cls=None,
         pretrain_class_model="/home3/huyuchen/pytorch_workplace/sgmse/BEATs_iter3_plus_AS2M.pt",
         inject_type="addition", p_uncond=0.0, encoder_type="beats",
-        multi_degradation=False, **kwargs
+        multi_degradation=False, aux_loss_weight=0.3, **kwargs
     ):
         """
         Create a new ScoreModel.
@@ -88,6 +89,7 @@ class ScoreModel(pl.LightningModule):
             pretrain_class_model = "/home3/huyuchen/pytorch_workplace/sgmse/BEATs_iter3_plus_AS2M.pt"
 
         self.multi_degradation = multi_degradation
+        self.aux_loss_weight = aux_loss_weight
 
         # Initialize Backbone DNN
         dnn_cls = BackboneRegistry.get_by_name(backbone)
@@ -265,7 +267,7 @@ class ScoreModel(pl.LightningModule):
         # Distortion regression (intensity)
         loss_distort = self.distort_mse_loss(distort_pred.squeeze(-1), distort_label.float())
 
-        loss = loss_score + 0.3 * (loss_noise + loss_reverb + loss_distort)
+        loss = loss_score + self.aux_loss_weight * (loss_noise + loss_reverb + loss_distort)
 
         # Noise classification accuracy
         pred = torch.argmax(noise_logits, dim=1)
