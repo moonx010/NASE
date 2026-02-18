@@ -62,6 +62,7 @@ class ScoreModel(pl.LightningModule):
         parser.add_argument("--loss_type", type=str, default="mse", choices=("mse", "mae"), help="The type of loss function to use.")
         parser.add_argument("--p_uncond", type=float, default=0.0, help="Probability of unconditional training for CFG (0.0 = baseline, no CFG)")
         parser.add_argument("--aux_loss_weight", type=float, default=0.3, help="Weight for auxiliary multi-task losses (0.0 = no aux loss)")
+        parser.add_argument("--inject_method", type=str, default="temb", choices=("temb", "addition"), help="How to inject conditioning: 'temb' (deep, ~37 ResBlocks) or 'addition' (shallow, input layer)")
         return parser
 
     def __init__(
@@ -69,7 +70,8 @@ class ScoreModel(pl.LightningModule):
         num_eval_files=20, loss_type='mse', data_module_cls=None,
         pretrain_class_model="/home3/huyuchen/pytorch_workplace/sgmse/BEATs_iter3_plus_AS2M.pt",
         inject_type="addition", p_uncond=0.0, encoder_type="beats",
-        multi_degradation=False, aux_loss_weight=0.3, **kwargs
+        multi_degradation=False, aux_loss_weight=0.3,
+        inject_method="temb", **kwargs
     ):
         """
         Create a new ScoreModel.
@@ -115,15 +117,22 @@ class ScoreModel(pl.LightningModule):
         self.inject_type = inject_type
         self.p_uncond = p_uncond
 
+        self.inject_method = inject_method if multi_degradation else inject_type
+
         if multi_degradation:
-            # --- Multi-degradation: 3-branch projection + temb injection ---
+            # --- Multi-degradation: 3-branch projection ---
             # 3 separate projection branches from shared 256-dim
             self.noise_proj = nn.Linear(256, 128)
             self.reverb_proj = nn.Linear(256, 128)
             self.distort_proj = nn.Linear(256, 128)
-            # Combined → temb dimension (nf*4 = 512)
-            self.cond_to_temb = nn.Sequential(
-                nn.Linear(384, 512), nn.SiLU(), nn.Linear(512, 512))
+            if inject_method == "temb":
+                # Combined → temb dimension (nf*4 = 512) for deep injection
+                self.cond_to_temb = nn.Sequential(
+                    nn.Linear(384, 512), nn.SiLU(), nn.Linear(512, 512))
+            else:
+                # Combined → input dimension (256) for shallow input addition
+                self.cond_to_input = nn.Sequential(
+                    nn.Linear(384, 256), nn.SiLU(), nn.Linear(256, 256))
             # Multi-task losses
             self.noise_ce_loss = nn.CrossEntropyLoss(reduction='mean')
             self.reverb_mse_loss = nn.MSELoss()
@@ -367,14 +376,21 @@ class ScoreModel(pl.LightningModule):
             reverb_feat = reverb_feat * reverb_mask
             distort_feat = distort_feat * distort_mask
 
-        # Concatenate → project to temb dimension (512)
+        # Concatenate branches
         combined = torch.cat([noise_feat, reverb_feat, distort_feat], dim=-1)  # (B, 384)
-        extra_cond = self.cond_to_temb(combined)  # (B, 512)
 
-        # DNN input (no input addition — conditioning via temb only)
         dnn_input = torch.cat([x, y], dim=1)
 
-        score = -self.dnn(dnn_input, t, extra_cond=extra_cond)
+        if self.inject_method == "temb":
+            # Deep injection: conditioning via temb (~37 ResBlocks)
+            extra_cond = self.cond_to_temb(combined)  # (B, 512)
+            score = -self.dnn(dnn_input, t, extra_cond=extra_cond)
+        else:
+            # Shallow injection: conditioning via input addition (1 point)
+            input_cond = self.cond_to_input(combined)  # (B, 256)
+            dnn_input = dnn_input + input_cond.unsqueeze(1).unsqueeze(-1)  # (B, 1, 256, 1) broadcast
+            score = -self.dnn(dnn_input, t)
+
         return score, noise_logits, reverb_pred, distort_pred
 
     def _step(self, batch, batch_idx):
@@ -440,7 +456,7 @@ class ScoreModel(pl.LightningModule):
         return score
 
     def _forward_multi(self, x, t, y, y_wav):
-        """Multi-degradation inference forward with temb injection."""
+        """Multi-degradation inference forward."""
         noise_emb, noise_logits, _, reverb_pred, distort_pred = self.noise_encoder(
             y_wav.squeeze(1))
         noise_emb = noise_emb.transpose(1, 2).contiguous()
@@ -452,16 +468,22 @@ class ScoreModel(pl.LightningModule):
         distort_feat = self.distort_proj(shared)  # (B, 128)
 
         # Per-degradation adaptive scaling at inference
-        # noise_scale controls overall conditioning strength
         noise_feat = noise_feat * self.noise_scale
         reverb_feat = reverb_feat * self.noise_scale
         distort_feat = distort_feat * self.noise_scale
 
         combined = torch.cat([noise_feat, reverb_feat, distort_feat], dim=-1)
-        extra_cond = self.cond_to_temb(combined)
 
         dnn_input = torch.cat([x, y], dim=1)
-        score = -self.dnn(dnn_input, t, extra_cond=extra_cond)
+
+        if self.inject_method == "temb":
+            extra_cond = self.cond_to_temb(combined)
+            score = -self.dnn(dnn_input, t, extra_cond=extra_cond)
+        else:
+            input_cond = self.cond_to_input(combined)  # (B, 256)
+            dnn_input = dnn_input + input_cond.unsqueeze(1).unsqueeze(-1)
+            score = -self.dnn(dnn_input, t)
+
         return score
 
     def compute_nc_confidence(self, y_wav):
@@ -546,11 +568,12 @@ class ScoreModel(pl.LightningModule):
     def forward_uncond(self, x, t, y):
         """Unconditional score: noise embedding is zeroed out."""
         dnn_input = torch.cat([x, y], dim=1)
-        if self.multi_degradation:
-            # Zero extra_cond for unconditional
+        if self.multi_degradation and self.inject_method == "temb":
+            # Zero extra_cond for unconditional (temb mode)
             extra_cond = torch.zeros(x.shape[0], 512, device=x.device)
             score = -self.dnn(dnn_input, t, extra_cond=extra_cond)
         else:
+            # Addition mode or legacy: no extra_cond, no input addition
             score = -self.dnn(dnn_input, t)
         return score
 
@@ -579,10 +602,17 @@ class ScoreModel(pl.LightningModule):
         distort_feat = self.distort_proj(shared) * distort_w
 
         combined = torch.cat([noise_feat, reverb_feat, distort_feat], dim=-1)
-        extra_cond = self.cond_to_temb(combined)
 
         dnn_input = torch.cat([x, y], dim=1)
-        score = -self.dnn(dnn_input, t, extra_cond=extra_cond)
+
+        if self.inject_method == "temb":
+            extra_cond = self.cond_to_temb(combined)
+            score = -self.dnn(dnn_input, t, extra_cond=extra_cond)
+        else:
+            input_cond = self.cond_to_input(combined)
+            dnn_input = dnn_input + input_cond.unsqueeze(1).unsqueeze(-1)
+            score = -self.dnn(dnn_input, t)
+
         return score
 
     def compute_multi_adaptive_weights(self, y_wav):

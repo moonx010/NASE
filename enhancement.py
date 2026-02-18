@@ -42,6 +42,7 @@ if __name__ == '__main__':
     parser.add_argument("--static_noise_w", type=float, default=None, help="Static noise branch weight (overrides adaptive)")
     parser.add_argument("--static_reverb_w", type=float, default=None, help="Static reverb branch weight (overrides adaptive)")
     parser.add_argument("--static_distort_w", type=float, default=None, help="Static distortion branch weight (overrides adaptive)")
+    parser.add_argument("--inject_method", type=str, default="temb", choices=("temb", "addition"), help="Injection method (must match training)")
     args = parser.parse_args()
 
     noisy_dir = join(args.test_dir, args.test_set)
@@ -69,6 +70,7 @@ if __name__ == '__main__':
     )
     if args.multi_degradation:
         load_kwargs['multi_degradation'] = True
+        load_kwargs['inject_method'] = args.inject_method
     model = ScoreModel.load_from_checkpoint(checkpoint_file, **load_kwargs)
     model.eval(no_ema=False)
     model.cuda()
