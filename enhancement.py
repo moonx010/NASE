@@ -131,27 +131,27 @@ if __name__ == '__main__':
                 # Score-level CFG with multi_degradation model
                 gs = args.guidance_scale
                 multi_weights = None  # use CFGScoreWrapper instead
-            elif args.static_noise_w is not None:
-                # Static per-branch weights
-                noise_w = args.static_noise_w
-                reverb_w = args.static_reverb_w if args.static_reverb_w is not None else 1.0
-                distort_w = args.static_distort_w if args.static_distort_w is not None else 1.0
-                info = {"noise_w": noise_w, "reverb_w": reverb_w, "distort_w": distort_w}
             else:
-                # Adaptive per-branch weights from encoder predictions
-                noise_w, reverb_w, distort_w, info = model.compute_multi_adaptive_weights(
-                    y_wav.cuda())
-            multi_weights = (noise_w, reverb_w, distort_w)
-            gs = None  # no legacy CFG
-            guidance_log.append({
-                "filename": filename,
-                "distance": 0.0,
-                "alpha": 1.0,
-                "w": 0.0,
-                "noise_w": round(noise_w, 4),
-                "reverb_w": round(reverb_w, 4),
-                "distort_w": round(distort_w, 4),
-            })
+                if args.static_noise_w is not None:
+                    # Static per-branch weights
+                    noise_w = args.static_noise_w
+                    reverb_w = args.static_reverb_w if args.static_reverb_w is not None else 1.0
+                    distort_w = args.static_distort_w if args.static_distort_w is not None else 1.0
+                else:
+                    # Adaptive per-branch weights from encoder predictions
+                    noise_w, reverb_w, distort_w, _ = model.compute_multi_adaptive_weights(
+                        y_wav.cuda())
+                multi_weights = (noise_w, reverb_w, distort_w)
+                gs = None  # no legacy CFG
+                guidance_log.append({
+                    "filename": filename,
+                    "distance": 0.0,
+                    "alpha": 1.0,
+                    "w": 0.0,
+                    "noise_w": round(noise_w, 4),
+                    "reverb_w": round(reverb_w, 4),
+                    "distort_w": round(distort_w, 4),
+                })
 
         # --- Embedding Scaling mode (new) ---
         elif args.noise_scale is not None:
