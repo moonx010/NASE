@@ -43,6 +43,7 @@ if __name__ == '__main__':
     parser.add_argument("--static_reverb_w", type=float, default=None, help="Static reverb branch weight (overrides adaptive)")
     parser.add_argument("--static_distort_w", type=float, default=None, help="Static distortion branch weight (overrides adaptive)")
     parser.add_argument("--inject_method", type=str, default="temb", choices=("temb", "addition"), help="Injection method (must match training)")
+    parser.add_argument("--zero_cond", action='store_true', help="Zero out conditioning (extra_cond=0) to test vanilla SGMSE+ behavior with trained model")
     args = parser.parse_args()
 
     noisy_dir = join(args.test_dir, args.test_set)
@@ -87,7 +88,9 @@ if __name__ == '__main__':
         print(f"Loaded reference embeddings: {args.ref_embeddings} — shape {ref_embeddings.shape}")
 
     # Determine mode
-    if args.multi_degradation:
+    if args.zero_cond:
+        mode = "Zero conditioning (unconditional)"
+    elif args.multi_degradation:
         if args.guidance_scale is not None:
             mode = f"Multi-deg CFG w={args.guidance_scale}"
         elif args.static_noise_w is not None:
@@ -128,7 +131,12 @@ if __name__ == '__main__':
 
         # --- Multi-degradation adaptive mode ---
         multi_weights = None
-        if args.multi_degradation:
+        if args.zero_cond and args.multi_degradation:
+            # Zero conditioning: use forward_uncond (extra_cond=0) via CFG w=-1
+            # (1+w)*cond + (-w)*uncond = 0*cond + 1*uncond = uncond
+            gs = -1.0
+            multi_weights = None
+        elif args.multi_degradation:
             if args.guidance_scale is not None:
                 # Score-level CFG with multi_degradation model
                 gs = args.guidance_scale
