@@ -28,9 +28,9 @@ if __name__ == '__main__':
      parser.add_argument("--no_wandb", action='store_true', help="Turn off logging to W&B")
      parser.add_argument("--wandb_project", type=str, default="nase-adaptive-guidance")
      parser.add_argument("--wandb_name", type=str, default=None, help="W&B run name")
-     parser.add_argument("--pretrain_class_model", type=str, required=True)
+     parser.add_argument("--pretrain_class_model", type=str, default="", help="Path to pretrained encoder (not needed for --encoder_type none)")
      parser.add_argument("--inject_type", type=str, default="addition")
-     parser.add_argument("--encoder_type", type=str, default="beats", choices=("beats", "wavlm", "panns"), help="Noise encoder type")
+     parser.add_argument("--encoder_type", type=str, default="beats", choices=("beats", "wavlm", "panns", "none"), help="Noise encoder type ('none' for vanilla SGMSE+)")
      parser.add_argument("--panns_ckpt", type=str, default=None, help="Path to pretrained PANNs CNN14 checkpoint (only for --encoder_type panns)")
      parser.add_argument("--max_epochs", type=int, default=160)
      parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs")
@@ -69,13 +69,14 @@ if __name__ == '__main__':
      )
 
      # Encoder-specific post-init: fine-tune all encoder params
-     # BEATs: weights already loaded inside BEATsEncoder.__init__
-     # WavLM: weights loaded from torchaudio hub inside WavLMEncoder.__init__
-     # PANNs: optionally load pretrained CNN14 checkpoint
-     if args.encoder_type == "panns" and args.panns_ckpt:
-          model.noise_encoder.load_pretrained_cnn14(args.panns_ckpt)
-     for param in model.noise_encoder.parameters():
-          param.requires_grad = True
+     if args.encoder_type != "none":
+          # BEATs: weights already loaded inside BEATsEncoder.__init__
+          # WavLM: weights loaded from torchaudio hub inside WavLMEncoder.__init__
+          # PANNs: optionally load pretrained CNN14 checkpoint
+          if args.encoder_type == "panns" and args.panns_ckpt:
+               model.noise_encoder.load_pretrained_cnn14(args.panns_ckpt)
+          for param in model.noise_encoder.parameters():
+               param.requires_grad = True
 
      # Set up logger
      if args.no_wandb:

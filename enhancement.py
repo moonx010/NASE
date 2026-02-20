@@ -36,7 +36,7 @@ if __name__ == '__main__':
     parser.add_argument("--noise_scale", type=float, default=None, help="Static noise embedding scale (0.0=no conditioning, 1.0=normal). Overrides adaptive.")
     parser.add_argument("--adaptive_scaling", action='store_true', help="Enable distance-based adaptive noise embedding scaling (no CFG)")
     parser.add_argument("--scaling_method", type=str, default="knn", choices=("knn", "prototype"), help="Distance method for adaptive scaling")
-    parser.add_argument("--encoder_type", type=str, default="beats", choices=("beats", "wavlm", "panns"), help="Noise encoder type (must match training)")
+    parser.add_argument("--encoder_type", type=str, default="beats", choices=("beats", "wavlm", "panns", "none"), help="Noise encoder type (must match training, 'none' for vanilla SGMSE+)")
     # Multi-degradation adaptive args
     parser.add_argument("--multi_degradation", action='store_true', help="Enable multi-degradation adaptive inference")
     parser.add_argument("--static_noise_w", type=float, default=None, help="Static noise branch weight (overrides adaptive)")

@@ -92,34 +92,41 @@ class ScoreModel(pl.LightningModule):
 
         self.multi_degradation = multi_degradation
         self.aux_loss_weight = aux_loss_weight
+        self.no_encoder = (encoder_type == "none")
 
         # Initialize Backbone DNN
         dnn_cls = BackboneRegistry.get_by_name(backbone)
         self.dnn = dnn_cls(**kwargs)
 
-        # Noise encoder (BEATs / WavLM / PANNs)
+        # Noise encoder (BEATs / WavLM / PANNs / none)
         self.encoder_type = encoder_type
-        encoder_cls = get_encoder(encoder_type)
-        if multi_degradation and encoder_type == "wavlm":
-            self.noise_encoder = encoder_cls(
-                pretrain_class_model=pretrain_class_model, multi_degradation=True)
+        if self.no_encoder:
+            self.noise_encoder = None
+            self.post_cnn = None
         else:
-            self.noise_encoder = encoder_cls(pretrain_class_model=pretrain_class_model)
-        encoder_dim = encoder_cls.embed_dim  # 768 for beats/wavlm, 2048 for panns
+            encoder_cls = get_encoder(encoder_type)
+            if multi_degradation and encoder_type == "wavlm":
+                self.noise_encoder = encoder_cls(
+                    pretrain_class_model=pretrain_class_model, multi_degradation=True)
+            else:
+                self.noise_encoder = encoder_cls(pretrain_class_model=pretrain_class_model)
+            encoder_dim = encoder_cls.embed_dim  # 768 for beats/wavlm, 2048 for panns
 
-        # Postprocessing modules — input dim adapts to encoder
-        self.post_cnn = torch.nn.Sequential(
-            torch.nn.Conv1d(encoder_dim, 256, 1, 1, 0),
-            torch.nn.PReLU(),
-            torch.nn.Conv1d(256, 256, 3, 1, 1)
-        )
+            # Postprocessing modules — input dim adapts to encoder
+            self.post_cnn = torch.nn.Sequential(
+                torch.nn.Conv1d(encoder_dim, 256, 1, 1, 0),
+                torch.nn.PReLU(),
+                torch.nn.Conv1d(256, 256, 3, 1, 1)
+            )
 
         self.inject_type = inject_type
         self.p_uncond = p_uncond
 
         self.inject_method = inject_method if multi_degradation else inject_type
 
-        if multi_degradation:
+        if self.no_encoder:
+            pass  # No projection layers needed
+        elif multi_degradation:
             # --- Multi-degradation: 3-branch projection ---
             # 3 separate projection branches from shared 256-dim
             self.noise_proj = nn.Linear(256, 128)
@@ -224,10 +231,31 @@ class ScoreModel(pl.LightningModule):
         return loss
 
     def _step_train(self, batch, batch_idx):
-        if self.multi_degradation:
+        if self.no_encoder:
+            return self._step_train_vanilla(batch, batch_idx)
+        elif self.multi_degradation:
             return self._step_train_multi(batch, batch_idx)
         else:
             return self._step_train_single(batch, batch_idx)
+
+    def _step_train_vanilla(self, batch, batch_idx):
+        """Training step for vanilla SGMSE+ (no noise encoder)."""
+        if self.multi_degradation:
+            x, y, y_wav, noise_label, reverb_label, distort_label = batch
+        else:
+            x, y, y_wav, noise_label = batch
+
+        t = torch.rand(x.shape[0], device=x.device) * (self.sde.T - self.t_eps) + self.t_eps
+        mean, std = self.sde.marginal_prob(x, t, y, y_wav)
+        z = torch.randn_like(x)
+        sigmas = std[:, None, None, None]
+        perturbed_data = mean + sigmas * z
+
+        dnn_input = torch.cat([perturbed_data, y], dim=1)
+        score = -self.dnn(dnn_input, t)
+        err = score * sigmas + z
+        loss = self._loss(err)
+        return loss
 
     def _step_train_single(self, batch, batch_idx):
         x, y, y_wav, noise_label = batch
@@ -285,7 +313,10 @@ class ScoreModel(pl.LightningModule):
         return loss, loss_score, loss_noise, loss_reverb, loss_distort, acc
 
     def training_step(self, batch, batch_idx):
-        if self.multi_degradation:
+        if self.no_encoder:
+            loss = self._step_train(batch, batch_idx)
+            self.log('train_loss', loss, on_step=True, on_epoch=True)
+        elif self.multi_degradation:
             loss, loss_score, loss_noise, loss_reverb, loss_distort, acc = self._step_train(batch, batch_idx)
             self.log('train_loss', loss, on_step=True, on_epoch=True)
             self.log('train_score_loss', loss_score, on_step=True, on_epoch=True)
@@ -420,7 +451,10 @@ class ScoreModel(pl.LightningModule):
         return loss
 
     def forward(self, x, t, y, y_wav):
-        if self.multi_degradation:
+        if self.no_encoder:
+            dnn_input = torch.cat([x, y], dim=1)
+            return -self.dnn(dnn_input, t)
+        elif self.multi_degradation:
             return self._forward_multi(x, t, y, y_wav)
         else:
             return self._forward_single(x, t, y, y_wav)
