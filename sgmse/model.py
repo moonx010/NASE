@@ -619,7 +619,7 @@ class ScoreModel(pl.LightningModule):
         """Compute per-degradation adaptive weights from encoder predictions.
 
         Returns:
-            noise_w: float — NC confidence (high = trust noise conditioning)
+            noise_w: float — 1 - P(none), i.e. probability that noise exists
             reverb_w: float — predicted T60 (high reverb = trust reverb conditioning)
             distort_w: float — predicted distortion intensity
             info: dict with raw predictions for logging
@@ -627,22 +627,27 @@ class ScoreModel(pl.LightningModule):
         with torch.no_grad():
             _, noise_logits, _, reverb_pred, distort_pred = self.noise_encoder(
                 y_wav.squeeze(1))
-            # Noise confidence: max sigmoid value
-            noise_conf = noise_logits.max(dim=-1)[0].item()
+            # noise_logits is sigmoid-applied (B, 11). Convert back to raw logits
+            # then apply softmax for proper probability distribution.
+            raw_logits = torch.logit(noise_logits.clamp(1e-6, 1 - 1e-6))
+            noise_probs = torch.softmax(raw_logits, dim=-1)  # (B, 11)
+            # none class = index 10. noise_w = 1 - P(none)
+            p_none = noise_probs[0, 10].item()
+            noise_w = 1.0 - p_none
+            pred_class = torch.argmax(noise_probs, dim=-1).item()
+
             # Reverb and distortion predictions are sigmoid'd → [0, 1]
             reverb_level = reverb_pred.squeeze(-1).item()
             distort_level = distort_pred.squeeze(-1).item()
 
-            # Adaptive weights: use predictions as confidence
-            # For noise: high confidence → trust conditioning
-            noise_w = noise_conf
             # For reverb: if reverb detected, trust reverb branch
             reverb_w = reverb_level
             # For distortion: if distortion detected, trust distortion branch
             distort_w = distort_level
 
         info = {
-            "noise_conf": round(noise_conf, 4),
+            "p_none": round(p_none, 4),
+            "pred_class": pred_class,
             "reverb_level": round(reverb_level, 4),
             "distort_level": round(distort_level, 4),
             "noise_w": round(noise_w, 4),

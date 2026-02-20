@@ -149,7 +149,7 @@ if __name__ == '__main__':
                     distort_w = args.static_distort_w if args.static_distort_w is not None else 1.0
                 else:
                     # Adaptive per-branch weights from encoder predictions
-                    noise_w, reverb_w, distort_w, _ = model.compute_multi_adaptive_weights(
+                    noise_w, reverb_w, distort_w, info = model.compute_multi_adaptive_weights(
                         y_wav.cuda())
                 multi_weights = (noise_w, reverb_w, distort_w)
                 gs = None  # no legacy CFG
@@ -161,6 +161,8 @@ if __name__ == '__main__':
                     "noise_w": round(noise_w, 4),
                     "reverb_w": round(reverb_w, 4),
                     "distort_w": round(distort_w, 4),
+                    "p_none": info.get("p_none", 0.0),
+                    "pred_class": info.get("pred_class", -1),
                 })
 
         # --- Embedding Scaling mode (new) ---
@@ -239,7 +241,7 @@ if __name__ == '__main__':
     if guidance_log:
         log_path = join(target_dir, "_guidance_log.csv")
         if args.multi_degradation:
-            fieldnames = ["filename", "distance", "alpha", "w", "noise_w", "reverb_w", "distort_w"]
+            fieldnames = ["filename", "distance", "alpha", "w", "noise_w", "reverb_w", "distort_w", "p_none", "pred_class"]
         else:
             fieldnames = ["filename", "distance", "alpha", "w"]
         with open(log_path, 'w', newline='') as f:
