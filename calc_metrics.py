@@ -1,4 +1,4 @@
-from os.path import join 
+from os.path import join
 from glob import glob
 from argparse import ArgumentParser
 from soundfile import read
@@ -16,6 +16,7 @@ if __name__ == '__main__':
     parser.add_argument("--test_dir", type=str, required=True, help='Directory containing the original test data (must have subdirectories clean/ and noisy/)')
     parser.add_argument("--test_set", type=str, default='noisy')
     parser.add_argument("--enhanced_dir", type=str, required=True, help='Directory containing the enhanced data')
+    parser.add_argument("--utmos", action='store_true', help='Also compute UTMOS (neural MOS prediction, requires pip install utmos)')
     args = parser.parse_args()
 
     test_dir = args.test_dir
@@ -23,7 +24,16 @@ if __name__ == '__main__':
     noisy_dir = join(test_dir, args.test_set)
     enhanced_dir = args.enhanced_dir
 
+    # Load UTMOS model if requested
+    utmos_model = None
+    if args.utmos:
+        import utmos
+        utmos_model = utmos.Score()
+        print("UTMOS model loaded")
+
     data = {"filename": [], "pesq": [], "estoi": [], "si_sdr": [], "si_sir": [],  "si_sar": []}
+    if args.utmos:
+        data["utmos"] = []
     sr = 16000
 
     # Evaluate standard metrics
@@ -48,29 +58,22 @@ if __name__ == '__main__':
         data["si_sir"].append(energy_ratios(x_method, x, n)[1])
         data["si_sar"].append(energy_ratios(x_method, x, n)[2])
 
-    # Save results as DataFrame    
-    df = pd.DataFrame(data)
+        if utmos_model is not None:
+            enhanced_path = join(enhanced_dir, filename)
+            data["utmos"].append(utmos_model.calculate_wav_file(enhanced_path))
 
-    # POLQA evaluation  -  requires POLQA license and server, uncomment at your own peril.
-    # This is batch processed for speed reasons and thus runs outside the for loop.
-    # if not basic:
-    #     clean_files = sorted(glob('{}/*.wav'.format(clean_dir)))
-    #     enhanced_files = sorted(glob('{}/*.wav'.format(enhanced_dir)))
-    #     clean_audios = [read(clean_file)[0] for clean_file in clean_files]
-    #     enhanced_audios = [read(enhanced_file)[0] for enhanced_file in enhanced_files]
-    #     polqa_vals = polqa(clean_audios, enhanced_audios, 16000, save_to=None)
-    #     polqa_vals = [val[1] for val in polqa_vals]
-    #     # Add POLQA column to DataFrame
-    #     df['polqa'] = polqa_vals
+    # Save results as DataFrame
+    df = pd.DataFrame(data)
 
     # Print results
     print(enhanced_dir)
-    #print("POLQA: {:.2f} ± {:.2f}".format(*mean_std(df["polqa"].to_numpy())))
     print("PESQ: {:.2f} ± {:.2f}".format(*mean_std(df["pesq"].to_numpy())))
     print("ESTOI: {:.2f} ± {:.2f}".format(*mean_std(df["estoi"].to_numpy())))
     print("SI-SDR: {:.1f} ± {:.1f}".format(*mean_std(df["si_sdr"].to_numpy())))
     print("SI-SIR: {:.1f} ± {:.1f}".format(*mean_std(df["si_sir"].to_numpy())))
     print("SI-SAR: {:.1f} ± {:.1f}".format(*mean_std(df["si_sar"].to_numpy())))
+    if args.utmos:
+        print("UTMOS: {:.3f} ± {:.3f}".format(*mean_std(df["utmos"].to_numpy())))
 
     # Save DataFrame as csv file
     df.to_csv(join(enhanced_dir, "_results.csv"), index=False)
