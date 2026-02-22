@@ -5,10 +5,19 @@ from soundfile import read
 from tqdm import tqdm
 from pesq import pesq
 import pandas as pd
+import torch
 
 from pystoi import stoi
 
 from sgmse.util.other import energy_ratios, mean_std
+
+# Fix for PyTorch 2.6+ weights_only=True default breaking fairseq/UTMOS
+_original_torch_load = torch.load
+def _patched_torch_load(*args, **kwargs):
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_torch_load(*args, **kwargs)
+torch.load = _patched_torch_load
 
 
 if __name__ == '__main__':
