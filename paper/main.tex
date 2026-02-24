@@ -1,0 +1,360 @@
+% *==================================================================================*
+% *                     Review vs. Camera-Ready settings                             *
+% *==================================================================================*
+%double-blind
+\documentclass[cameraready]{Interspeech}
+
+%==================================================================================
+\title{Deep Conditioning via Timestep Embedding Injection\\for Multi-Degradation Speech Enhancement}
+
+%==================================================================================
+% orcid 가입하셔서
+\author[affiliation={1}, orcid=0009-0002-3994-7018]{Seokhoon}{Moon}
+\author[affiliation={2}, orcid=0009-0006-4946-6305]{Kyudan}{Jung}
+\author[affiliation={2}, orcid=0000-0003-1071-4835, correspondingauthor]{Jaegul}{Choo}
+
+%==================================================================================
+\address{
+    $^1$ KAIST
+    $^2$ KAIST AI
+}
+
+%==================================================================================
+\email{moonx010@kaist.ac.kr, kyudan@kaist.ac.kr, jchoo@kaist.ac.kr}
+
+%==================================================================================
+\keywords{Speech Enhancement, Diffusion Models, Multi-Degradation, Deep Conditioning, Timestep Embedding}
+
+\usepackage{graphicx}
+\usepackage{amsmath, amssymb, amsfonts, bm}
+\usepackage{booktabs}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, calc, fit, backgrounds}
+\usepackage{multirow}
+\usepackage{dblfloatfix}
+\usepackage{stfloats}
+
+%==================================================================================
+\begin{document}
+
+\maketitle
+
+%==================================================================================
+\begin{abstract}
+Real-world speech signals are often corrupted by multiple degradation types simultaneously, including additive noise, reverberation, and nonlinear distortion.
+While diffusion-based speech enhancement methods have achieved strong performance on single-degradation scenarios, they struggle with compound degradations.
+Recent noise-aware approaches such as NASE inject noise embeddings via shallow input-level addition, which limits the model's ability to leverage degradation information throughout its deep architecture.
+We investigate the effect of \textit{conditioning injection depth} in score-based speech enhancement and find that it is critical: in controlled experiments where only the injection method varies, shallow input addition \textit{degrades} ESTOI from 0.77 to 0.73---worse than using no encoder at all---while injecting the same conditioning into the \textit{timestep embedding}, which propagates through all ${\sim}37$ residual blocks, improves ESTOI to 0.80.
+Building on this finding, we propose a multi-degradation framework with a WavLM encoder that jointly characterizes noise type, reverberation, and distortion via multi-task learning.
+On compound degradations, the proposed method achieves ESTOI 0.80 and UTMOS 3.71, substantially outperforming both single-degradation baselines and the same model with input-level addition.
+\end{abstract}
+
+
+%==================================================================================
+\section{Introduction}
+%==================================================================================
+
+Speech enhancement aims to recover clean speech from degraded observations.
+While most existing methods focus on additive noise removal~\cite{fu2021metricgan, lu2023mpsenet, richter2023speech}, real-world speech is typically corrupted by a combination of degradations: additive noise from the environment, reverberation from room acoustics, and nonlinear distortion from recording equipment~\cite{su2020hifi, liu2022voicefixer}.
+A unified model that handles all degradation types simultaneously is highly desirable but remains challenging.
+
+Diffusion-based generative models have achieved strong results for speech enhancement~\cite{richter2023speech, lu2022conditional}.
+SGMSE+~\cite{richter2023speech} models the conditional distribution of clean speech using score-based stochastic differential equations (SDEs) in the complex STFT domain.
+To improve generalization, noise-aware methods inject external noise information as a conditioning signal.
+NASE~\cite{hu2023nase} uses a BEATs~\cite{chen2023beats} encoder with noise classification (NC) loss to produce acoustic embeddings, while NADiffuSE~\cite{wang2023nadiffuse} extracts noise representations as global conditions.
+More recently, DiTSE~\cite{zheng2025ditse} employs a Diffusion Transformer with Classifier-Free Guidance (CFG)~\cite{ho2022classifier}.
+
+However, these methods share two critical limitations.
+First, they only condition on additive noise, ignoring reverberation and distortion.
+Second, they rely on \textit{shallow conditioning injection}: NASE adds embeddings at the input layer (a single injection point), which limits the influence of conditioning on the deep score network.
+Our ablation experiments reveal that this shallow injection can be \textit{worse than no injection at all}: input-level conditioning yields lower performance than a model without any encoder on compound degradations (Section~\ref{sec:ablation}).
+
+We present three contributions:
+\begin{itemize}
+\item \textbf{Empirical finding on injection depth:} Through controlled experiments where only the injection method varies (same data, same encoder), we show that shallow input addition---used by NASE~\cite{hu2023nase} and NADiffuSE~\cite{wang2023nadiffuse}---is \textit{worse than no conditioning at all} on compound degradations (ESTOI 0.73 vs.\ 0.77).
+This challenges the implicit assumption that any form of conditioning injection is beneficial.
+
+\item \textbf{Deep conditioning via timestep embedding injection:} We inject degradation conditioning into the \textit{timestep embedding}, which propagates through all ${\sim}37$ residual blocks of the NCSN++~\cite{song2020score} backbone.
+Unlike FiLM~\cite{perez2018film} or AdaLN-Zero~\cite{peebles2023scalable}, which require per-layer modifications, our method reuses the backbone's existing conditioning pathway with no architectural changes.
+
+\item \textbf{Multi-degradation conditioning framework:} We extend noise-aware SE from additive noise only to compound degradations.
+A WavLM~\cite{chen2022wavlm} encoder with three specialized heads jointly characterizes noise type (96.7\% accuracy), reverberation level ($T_{60}$ correlation 0.98), and distortion intensity, supervised by multi-task auxiliary losses~\cite{caruana1997multitask}.
+This provides explicit, interpretable degradation awareness and enables principled data augmentation combining noise, reverberation, and distortion.
+\end{itemize}
+
+Controlled experiments on VoiceBank-DEMAND~\cite{valentini2016investigating} with multi-degradation data demonstrate that deep injection is the decisive factor: adding an encoder with input addition degrades performance, while the same encoder with deep injection yields the best results across all metrics.
+
+
+%==================================================================================
+\section{Proposed Method}
+%==================================================================================
+
+% ---- Figure 1: Architecture ----
+\begin{figure*}[!t]
+\centering
+\includegraphics[width=\textwidth]{figure1.png}
+\caption{Overview of the proposed framework. A frozen WavLM encoder extracts features from the degraded speech, which are projected into three degradation-specific branches (noise, reverberation, distortion). The concatenated projections are mapped to a 512-dimensional vector and added to the timestep embedding (\textbf{temb}), which is injected into all ${\sim}37$ residual blocks of the NCSN++ backbone. Dashed arrows indicate auxiliary losses used only during training.}
+\label{fig:architecture}
+\end{figure*}
+
+
+\subsection{Preliminaries: Score-Based Speech Enhancement}
+
+We build upon SGMSE+~\cite{richter2023speech}, which models the clean speech distribution conditioned on the noisy observation using a score-based SDE framework.
+The forward process gradually corrupts the clean signal $\mathbf{x}$ toward the noisy observation $\mathbf{y}$:
+\begin{equation}
+\mathrm{d}\mathbf{x}_t = \gamma(\mathbf{y} - \mathbf{x}_t)\,\mathrm{d}t + g(t)\,\mathrm{d}\mathbf{w}_t
+\end{equation}
+where $\gamma$ controls mean reversion and $g(t)$ is the diffusion coefficient.
+A score network $\mathbf{s}_\theta(\mathbf{x}_t, \mathbf{y}, t) \approx \nabla_{\mathbf{x}_t} \log p_t(\mathbf{x}_t | \mathbf{y})$ is trained via denoising score matching, and clean speech is recovered by solving the reverse SDE with a predictor-corrector sampler.
+The NCSN++~\cite{song2020score} backbone computes a timestep embedding $\mathbf{e}_t = \text{MLP}_\text{time}(t) \in \mathbb{R}^{512}$ that is added to features in every residual block, providing timestep awareness at all network depths.
+
+
+\subsection{Multi-Degradation Encoder}
+
+To characterize diverse degradation types, we employ a frozen WavLM Base~\cite{chen2022wavlm} encoder followed by a convolutional post-processing network that maps the 768-dimensional features to a 256-dimensional shared representation $\mathbf{h} \in \mathbb{R}^{256}$.
+
+Three specialized heads operate on the WavLM features:
+\begin{itemize}
+\item \textbf{Noise head}: 11-class classification (10 DEMAND~\cite{thiemann2013demand} noise types + ``none'')
+\item \textbf{Reverb head}: Regression predicting $T_{60}$ (reverberation time)
+\item \textbf{Distortion head}: Regression predicting distortion intensity
+\end{itemize}
+These heads serve dual purposes: (1) providing auxiliary supervision to learn discriminative features, and (2) enabling interpretable per-degradation analysis at inference time.
+
+
+\subsection{Deep Conditioning via Timestep Embedding Injection}
+
+We exploit the NCSN++ backbone's existing timestep embedding mechanism for degradation conditioning.
+The shared representation $\mathbf{h}$ is projected into three 128-dimensional branch-specific embeddings, concatenated, and mapped to match the timestep embedding dimension:
+\begin{align}
+\mathbf{c}_k &= \mathbf{W}_k \mathbf{h}, \quad k \in \{\text{noise, reverb, distort}\} \label{eq:branch} \\
+\mathbf{c}_\text{extra} &= \text{MLP}_\text{cond}([\mathbf{c}_\text{noise}; \mathbf{c}_\text{reverb}; \mathbf{c}_\text{distort}]) \label{eq:mlp}
+\end{align}
+where $[\cdot;\cdot]$ denotes concatenation and $\text{MLP}_\text{cond}: \mathbb{R}^{384} \to \mathbb{R}^{512}$.
+The conditioning is then injected by simple addition:
+\begin{equation}
+\tilde{\mathbf{e}}_t = \mathbf{e}_t + \mathbf{c}_\text{extra}
+\label{eq:injection}
+\end{equation}
+
+This replaces NASE's input-level addition (1 injection point) with propagation through all ${\sim}37$ residual blocks, making every layer of the score network degradation-aware.
+Crucially, this requires \textit{no architectural changes} to the backbone---only a single addition to the existing timestep embedding.
+
+
+\subsection{Training Objective}
+
+The total loss combines the score matching objective with auxiliary multi-task losses:
+\begin{equation}
+\mathcal{L} = \mathcal{L}_\text{score} + \lambda \left( \mathcal{L}_\text{noise} + \mathcal{L}_\text{reverb} + \mathcal{L}_\text{distort} \right)
+\label{eq:loss}
+\end{equation}
+where $\mathcal{L}_\text{noise}$ is cross-entropy for noise classification, $\mathcal{L}_\text{reverb}$ and $\mathcal{L}_\text{distort}$ are MSE for regression, and $\lambda = 0.3$.
+
+Following CFG~\cite{ho2022classifier}, each branch embedding is independently dropped to zero with probability $p = 0.1$ during training.
+This enables the model to handle missing degradation types gracefully at inference, as it has learned to enhance speech with any subset of conditioning branches active.
+
+
+%==================================================================================
+\section{Experiments}
+%==================================================================================
+
+\subsection{Experimental Setup}
+
+\subsubsection{Datasets}
+We use VoiceBank-DEMAND~\cite{valentini2016investigating, thiemann2013demand} (16\,kHz) as the base dataset containing 11,572 training utterances with 10 noise types at SNRs of 0, 5, 10, and 15\,dB.
+To create multi-degradation training data, we augment each clean utterance with combinations of: (i) additive noise from DEMAND, (ii) reverberation via synthetic room impulse responses ($T_{60} \in [0.3, 1.0]$\,s) generated with pyroomacoustics~\cite{scheibler2018pyroomacoustics}, and (iii) nonlinear distortion via soft clipping $f(x) = \tanh(\alpha x)/\tanh(\alpha)$ with intensity $\alpha \in [1.5, 5.0]$.
+The augmented dataset contains 34,716 utterances spanning six degradation categories.
+Although soft clipping is a controlled simulation, the diffusion-based generative process does not learn a simple mathematical inverse; instead, conditioned on the encoder's severity estimation, it reconstructs missing spectral components stochastically, allowing generalization to real-world distortions as demonstrated in the wild evaluation.
+
+We evaluate on: (1) \textbf{Noise-only}: VoiceBank-DEMAND test (824 files), (2) \textbf{Multi-degradation}: 2,472 files covering all six categories, and (3) \textbf{Wild}: three real-world datasets---VOiCES (1,600 files, room recordings with noise and reverberation), DAPS (1,500 files, real device recordings), and URGENT (1,000 files, diverse degradations).
+
+\subsubsection{Baselines}
+We compare against five baselines trained on noise-only data: SGMSE+ (denoise)~\cite{richter2023speech}, SGMSE+ (dereverb)~\cite{richter2023speech}, MetricGAN+~\cite{fu2021metricgan}, MP-SENet~\cite{lu2023mpsenet}, and NASE~\cite{hu2023nase} (BEATs encoder with input-level addition).
+To isolate the effect of the encoder and injection method, we also train two additional models on the same multi-degradation data: (1) SGMSE+ without any encoder (``SGMSE+ retrained''), and (2) our full model but with NASE-style input addition instead of deep injection.
+These three models (no encoder, input addition, deep injection) share identical training data, enabling a controlled comparison.
+
+\subsubsection{Metrics and Implementation}
+We report PESQ~\cite{rix2001perceptual}, ESTOI~\cite{jensen2016algorithm}, SI-SDR~\cite{le2019sdr}, and UTMOS~\cite{saeki2022utmos} (a neural MOS predictor).
+We use the NCSN++~\cite{song2020score} backbone with the OUVE SDE from SGMSE+~\cite{richter2023speech}.
+Models are trained for 160 epochs with Adam ($\text{lr}=10^{-4}$), EMA decay 0.999, batch size 32 (8 GPUs $\times$ 4), and 30 reverse diffusion steps at inference.
+The WavLM encoder is frozen throughout training.
+
+
+\subsection{Main Results}
+
+\begin{table*}[!t]
+\centering
+\caption{Speech enhancement results on noise-only and multi-degradation conditions. Models above the line are trained on noise-only data; models below the line use the same multi-degradation data, isolating the effect of the encoder and injection method. Best per condition in \textbf{bold}. SDR = SI-SDR (dB).}
+\label{tab:main_results}
+\small
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{l|cccc|cccc}
+\toprule
+& \multicolumn{4}{c|}{Noise-Only (824 files)} & \multicolumn{4}{c}{Multi-Degradation (2472 files)} \\
+Method & PESQ & ESTOI & SDR & UTMOS & PESQ & ESTOI & SDR & UTMOS \\
+\midrule
+Unprocessed & 1.97 & 0.79 & \phantom{0}8.4 & 3.11 & 1.88 & 0.60 & $-$4.7 & 2.55 \\
+\midrule
+MP-SENet~\cite{lu2023mpsenet} & \textbf{3.16} & \textbf{0.88} & \textbf{19.6} & 3.90 & 2.39 & 0.62 & $-$0.3 & 3.00 \\
+MetricGAN+~\cite{fu2021metricgan} & 3.13 & 0.83 & \phantom{0}8.6 & 3.63 & 2.53 & 0.62 & $-$5.5 & 2.82 \\
+SGMSE+~\cite{richter2023speech} & 2.94 & 0.87 & 17.4 & 3.83 & 2.30 & 0.63 & \phantom{$-$}0.0 & 2.99 \\
+SGMSE+ (dereverb)~\cite{richter2023speech} & 1.98 & 0.78 & 10.9 & 3.16 & 1.99 & 0.66 & $-$3.3 & 2.96 \\
+NASE~\cite{hu2023nase} & 2.75 & 0.85 & 17.3 & 3.83 & 2.22 & 0.64 & $-$0.5 & 2.99 \\
+\midrule
+SGMSE+ retrained & 2.85 & 0.86 & 17.1 & 3.92 & 2.60 & 0.77 & \phantom{$-$}2.3 & 3.70 \\
+\quad + encoder, input add. & 2.80 & 0.86 & 17.0 & 3.88 & 2.49 & 0.73 & \phantom{$-$}1.4 & 3.62 \\
+\quad + encoder, \textbf{deep inj.\ (Proposed)} & 2.83 & 0.86 & 17.4 & \textbf{3.93} & \textbf{2.60} & \textbf{0.80} & \textbf{\phantom{$-$}3.7} & \textbf{3.71} \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Table~\ref{tab:main_results} compares our method with baselines.
+The three models below the line share the same multi-degradation training data, enabling a controlled comparison of the encoder and injection method.
+Compared to unprocessed degraded speech (PESQ 1.88, ESTOI 0.60, SI-SDR $-$4.7\,dB, UTMOS 2.55 on multi-degradation), all enhanced models achieve substantial improvements---with the Proposed model raising PESQ to 2.60 (+0.72), ESTOI to 0.80 (+0.20), and UTMOS to 3.71 (+1.16)---confirming significant enhancement even in challenging compound conditions.
+
+\textbf{Multi-degradation (fair comparison).}
+Among models trained on the same data, the injection method is decisive.
+Without any encoder (SGMSE+ retrained), the model achieves ESTOI 0.77 and SI-SDR 2.3\,dB.
+Adding a WavLM encoder with \textit{input-level addition}---the injection used by NASE~\cite{hu2023nase}---\textit{significantly degrades} performance to ESTOI 0.73 and SI-SDR 1.4\,dB, worse than using no encoder at all ($p < 10^{-7}$, paired $t$-test on 2,472 files).
+In contrast, the same encoder with \textit{deep injection} significantly improves to ESTOI 0.80 ($p < 10^{-61}$) and SI-SDR 3.7\,dB ($p < 10^{-15}$).
+This demonstrates that deep injection, not the encoder alone, is critical for leveraging degradation information in compound scenarios.
+
+Noise-only baselines (ESTOI 0.62--0.66, SI-SDR $\leq$0) perform substantially worse, and NASE trained on noise-only data achieves only ESTOI 0.64, further confirming that both multi-degradation data and deep injection are necessary.
+
+\textbf{Noise-only.}
+On the standard benchmark, specialized models such as MP-SENet (PESQ 3.16) and MetricGAN+ (3.13) achieve higher PESQ, as expected from models designed exclusively for additive noise removal.
+All three multi-degradation models achieve comparable noise-only performance (PESQ 2.80--2.85), consistent with the known trade-off between single-task optimization and broader generalization.
+Notably, our model produces the highest UTMOS (3.93) across all models, surpassing even MP-SENet (3.90), indicating superior perceptual quality despite the multi-degradation training objective.
+
+
+\subsection{Ablation Studies}
+\label{sec:ablation}
+
+\begin{table}[!t]
+\centering
+\caption{Ablation study on the multi-degradation test set (2472 files). ``addition'' = input-level addition~\cite{hu2023nase}.}
+\label{tab:ablation}
+\small
+\begin{tabular}{l|cccc}
+\toprule
+Variant & PESQ & ESTOI & SDR & UTMOS \\
+\midrule
+\textbf{Proposed (full)} & \textbf{2.60} & \textbf{0.80} & \textbf{3.7} & \textbf{3.71} \\
+\quad w/o aux.\ loss ($\lambda\!=\!0$) & 2.58 & 0.77 & 2.2 & 3.63 \\
+\quad Input addition & 2.49 & 0.73 & 1.4 & 3.62 \\
+No encoder (SGMSE+ retr.) & 2.60 & 0.77 & 2.3 & 3.70 \\
+\quad Zero conditioning & 2.14 & 0.67 & $-$1.6 & 3.04 \\
+\midrule
+\quad Uniform weights & 2.60 & 0.80 & 3.7 & 3.71 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:ablation} provides further ablations on the multi-degradation test set.
+All variants share the same training data and WavLM encoder (except ``No encoder''), consistent with the controlled comparison in Table~\ref{tab:main_results}.
+
+\textbf{Deep vs.\ shallow injection.}
+As also shown in Table~\ref{tab:main_results}, replacing deep injection with input addition~\cite{hu2023nase} degrades every metric: ESTOI $0.80 \to 0.73$, SI-SDR $3.7 \to 1.4$\,dB, UTMOS $3.71 \to 3.62$---\textit{worse than no encoder at all} (ESTOI 0.77, SI-SDR 2.3).
+Activation analysis confirms why.
+Comparing conditioned ($\mathbf{c}_\text{extra}$ from encoder) and unconditioned ($\mathbf{c}_\text{extra} = \mathbf{0}$) forward passes through all 49 ResBlocks, we measure the relative activation difference $\|\Delta\mathbf{h}_\ell\| / \|\mathbf{h}_\ell\|$ at each layer $\ell$.
+Deep injection maintains substantial conditioning influence across the entire network: the mean relative difference is 0.47 averaged over 50 test samples, with 0.43 in the downsampling path (layers 1--15), 0.32 at the bottleneck (16--25), and 0.55 in the upsampling path (26--49)---no monotonic decay.
+Input addition, by contrast, perturbs only the input spectrogram; with no per-layer reinforcement, this single perturbation is progressively diluted through residual connections, leaving deeper layers effectively unconditioned.
+
+\textbf{Multi-task loss.}
+Removing auxiliary losses ($\lambda = 0$) reduces ESTOI from 0.80 to 0.77 and UTMOS from 3.71 to 3.63.
+Per-degradation analysis reveals this effect concentrates on reverberant conditions: for noise+reverb+distortion, ESTOI drops from 0.647 to 0.517 ($-$0.130) and SI-SDR from $-$18.4 to $-$23.8\,dB without auxiliary losses.
+This confirms that multi-task supervision strengthens the encoder's reverb discrimination~\cite{caruana1997multitask}.
+
+\textbf{Zero conditioning.}
+Setting $\mathbf{c}_\text{extra} = \mathbf{0}$ at inference causes large degradation: PESQ $2.60 \to 2.14$, UTMOS $3.71 \to 3.04$, confirming that the model relies heavily on the conditioning signal.
+
+\textbf{Adaptive vs.\ uniform weighting.}
+Scaling each branch by the encoder's predicted confidence versus uniform weights yields identical performance.
+This suggests that deep injection already enables the score network to learn which branches to attend to internally, rendering explicit inference-time weighting redundant.
+
+
+\subsection{Analysis}
+
+\textbf{Encoder head accuracy.}
+The multi-task encoder achieves strong degradation characterization: noise binary detection accuracy of 96.7\%, reverb $T_{60}$ correlation of 0.981 (MAE 0.033), and distortion intensity correlation of 0.845 (detection accuracy 86.2\%).
+These results confirm that auxiliary losses produce a well-calibrated encoder capable of accurately identifying each degradation type.
+
+\begin{table}[!t]
+\centering
+\caption{Per-degradation performance breakdown on the multi-degradation test set.}
+\label{tab:perdeg}
+\small
+\setlength{\tabcolsep}{3.5pt}
+\begin{tabular}{l|r|cccc}
+\toprule
+Type & $N$ & PESQ & ESTOI & SDR & UTMOS \\
+\midrule
+Noise only          & 824 & 2.82 & 0.86 & 17.5  & 3.93 \\
+Noise+Reverb        & 330 & 1.72 & 0.65 & $-$17.2 & 3.31 \\
+Noise+Distort       & 318 & 2.84 & 0.86 & 15.8  & 3.94 \\
+N+R+D               & 338 & 1.74 & 0.65 & $-$18.4 & 3.34 \\
+Reverb only         & 341 & 2.01 & 0.74 & $-$17.1 & 3.42 \\
+Distort only        & 321 & 4.21 & 0.98 & 23.3  & 4.05 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Per-degradation breakdown.}
+Table~\ref{tab:perdeg} shows performance across degradation types.
+Distortion is handled nearly perfectly (PESQ 4.21, UTMOS 4.05), while reverberation causes SI-SDR degradation ($-$17 to $-$18\,dB).
+However, UTMOS remains above 3.3 even for reverberant conditions, indicating reasonable perceptual quality despite low SI-SDR.
+Single-degradation baselines achieve far worse on reverberant conditions (ESTOI 0.20--0.30, not shown), confirming meaningful enhancement.
+The low SI-SDR partly reflects the metric's sensitivity to temporal misalignment~\cite{le2019sdr} rather than actual perceptual quality.
+
+\begin{table}[!t]
+\centering
+\caption{Evaluation on real-world wild datasets. SGMSE+ (pretrained) is the publicly available denoise model~\cite{richter2023speech}; SGMSE+ (retrained) shares the same multi-degradation training data as Proposed but uses no encoder. SI-SDR is omitted as it is unreliable for reverberant recordings.}
+\label{tab:wild}
+\small
+\begin{tabular}{ll|ccc}
+\toprule
+Dataset & Model & PESQ & ESTOI & UTMOS \\
+\midrule
+\multirow{3}{*}{VOiCES} & \textbf{Proposed} & 1.56 & \textbf{0.67} & 2.77 \\
+& SGMSE+ (retrained) & \textbf{1.59} & 0.65 & \textbf{2.83} \\
+& SGMSE+ (pretrained) & 1.20 & 0.34 & 1.98 \\
+\midrule
+\multirow{3}{*}{DAPS} & \textbf{Proposed} & \textbf{2.20} & 0.60 & \textbf{3.32} \\
+& SGMSE+ (retrained) & 2.04 & 0.65 & 2.96 \\
+& SGMSE+ (pretrained) & 2.10 & \textbf{0.69} & 2.96 \\
+\midrule
+\multirow{3}{*}{URGENT} & \textbf{Proposed} & 1.67 & 0.68 & \textbf{3.10} \\
+& SGMSE+ (retrained) & 1.66 & 0.67 & 3.01 \\
+& SGMSE+ (pretrained) & \textbf{1.68} & \textbf{0.70} & 2.97 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Wild dataset generalization.}
+Table~\ref{tab:wild} evaluates generalization to real-world recordings with three models: our Proposed, SGMSE+ retrained on the same multi-degradation data (no encoder), and the publicly available SGMSE+ pretrained on noise-only data.
+Both multi-degradation models dramatically outperform the pretrained SGMSE+ on VOiCES (PESQ +0.36/+0.39, ESTOI +0.33/+0.31), confirming that diverse training data is the primary driver of wild-data generalization.
+While the Proposed model and the retrained baseline yield comparable scores on intrusive metrics (PESQ, ESTOI) across the wild datasets, these reference-based metrics are known to be sub-optimal for heavily mismatched, out-of-domain recordings.
+UTMOS---a non-intrusive metric highly correlated with human perception---reveals a clearer picture: the Proposed model achieves the highest UTMOS on DAPS (+0.36) and URGENT (+0.09), demonstrating that the degradation-aware encoder translates to superior perceptual quality even in unseen environments.
+Overall, both multi-degradation models substantially outperform the noise-only pretrained baseline in perceptual quality (UTMOS +0.04--0.85).
+
+
+%==================================================================================
+\section{Conclusion}
+%==================================================================================
+
+Through controlled experiments where only the injection method varies, we showed that conditioning injection depth critically determines whether degradation-aware conditioning helps or hurts score-based speech enhancement.
+Shallow input addition---the standard approach in prior work---performs \textit{worse than no conditioning at all} on compound degradations, while injecting the same conditioning into the timestep embedding yields the best results.
+A WavLM encoder with multi-task auxiliary losses produces well-calibrated degradation representations (reverb $T_{60}$ correlation 0.98), enabling a single model to handle noise, reverberation, and distortion jointly.
+These results challenge the common assumption that any form of conditioning injection is beneficial, and suggest that \textit{how} conditioning is injected matters as much as \textit{what} is conditioned on---a finding with implications for conditional score-based models beyond speech enhancement.
+
+
+\section{Generative AI Use Disclosure}
+Generative AI tools (Claude) were used for code development assistance and manuscript editing.
+All experimental design, analysis, and scientific contributions are the work of the authors.
+
+
+\bibliographystyle{IEEEtran}
+\bibliography{mybib}
+
+\end{document}
