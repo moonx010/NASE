@@ -11,7 +11,7 @@
 set -e
 
 CKPT="logs/multi-deg-wavlm-v2/epoch=159-last.ckpt"
-WAVLM="/home/nas4_user/kyudanjung/seokhoonmoon/pretrained_models/WavLM-Large.pt"
+WAVLM="/home/nas4_user/kyudanjung/seokhoonmoon/data/BEATs_iter3_plus_AS2M.pt"  # WavLM ignores this; argparse requires it
 D="/home/nas4_user/kyudanjung/seokhoonmoon/data"
 N=30
 TAG="cfg-sweep"

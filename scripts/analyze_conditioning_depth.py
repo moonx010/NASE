@@ -15,7 +15,7 @@ Usage:
     conda activate sgmse
     CUDA_VISIBLE_DEVICES=3 python scripts/analyze_conditioning_depth.py \
         --ckpt logs/multi-deg-wavlm-v2/epoch=159-last.ckpt \
-        --pretrain_class_model /home/nas4_user/kyudanjung/seokhoonmoon/pretrained_models/WavLM-Large.pt \
+        --pretrain_class_model /home/nas4_user/kyudanjung/seokhoonmoon/data/BEATs_iter3_plus_AS2M.pt \
         --test_dir /home/nas4_user/kyudanjung/seokhoonmoon/data/multi_degradation_16k/test_multi \
         --output_dir analysis/conditioning_depth \
         --n_samples 50
