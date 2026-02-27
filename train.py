@@ -69,7 +69,8 @@ if __name__ == '__main__':
      )
 
      # Encoder-specific post-init: fine-tune all encoder params
-     if args.encoder_type != "none":
+     # Skip if stage1_ckpt is used (encoder pipeline already frozen by _load_stage1)
+     if args.encoder_type != "none" and not getattr(args, 'stage1_ckpt', None):
           # BEATs: weights already loaded inside BEATsEncoder.__init__
           # WavLM: weights loaded from torchaudio hub inside WavLMEncoder.__init__
           # PANNs: optionally load pretrained CNN14 checkpoint

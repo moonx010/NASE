@@ -63,6 +63,7 @@ class ScoreModel(pl.LightningModule):
         parser.add_argument("--p_uncond", type=float, default=0.0, help="Probability of unconditional training for CFG (0.0 = baseline, no CFG)")
         parser.add_argument("--aux_loss_weight", type=float, default=0.3, help="Weight for auxiliary multi-task losses (0.0 = no aux loss)")
         parser.add_argument("--inject_method", type=str, default="temb", choices=("temb", "addition"), help="How to inject conditioning: 'temb' (deep, ~37 ResBlocks) or 'addition' (shallow, input layer)")
+        parser.add_argument("--stage1_ckpt", type=str, default=None, help="Path to Stage 1 encoder-heads checkpoint. Loads post_cnn/projs/heads and freezes encoder pipeline.")
         return parser
 
     def __init__(
@@ -71,7 +72,7 @@ class ScoreModel(pl.LightningModule):
         pretrain_class_model="/home3/huyuchen/pytorch_workplace/sgmse/BEATs_iter3_plus_AS2M.pt",
         inject_type="addition", p_uncond=0.0, encoder_type="beats",
         multi_degradation=False, aux_loss_weight=0.3,
-        inject_method="temb", **kwargs
+        inject_method="temb", stage1_ckpt=None, **kwargs
     ):
         """
         Create a new ScoreModel.
@@ -175,6 +176,53 @@ class ScoreModel(pl.LightningModule):
         self.data_module = data_module_cls(
             **kwargs, gpu=kwargs.get('gpus', 0) > 0,
             multi_degradation=multi_degradation)
+
+        # Stage 2: load pre-trained encoder pipeline from Stage 1 and freeze
+        if stage1_ckpt is not None and multi_degradation:
+            self._load_stage1(stage1_ckpt)
+
+    def _load_stage1(self, ckpt_path):
+        """Load Stage 1 encoder-heads weights and freeze the encoder pipeline.
+
+        Stage 1 trains: WavLM(frozen) → post_cnn → projs → heads
+        Stage 2 freezes all of these and only trains: cond_to_temb + score network
+        """
+        import logging
+        log = logging.getLogger(__name__)
+
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        state = ckpt['state_dict']
+
+        # Load post_cnn, projs, heads from Stage 1 checkpoint
+        loaded = []
+        for name, param in self.named_parameters():
+            if name in state and name not in ['wavlm']:
+                # Match post_cnn.*, noise_proj.*, reverb_proj.*, distort_proj.*,
+                # noise_head.*, reverb_head.*, distort_head.*
+                for prefix in ['post_cnn', 'noise_proj', 'reverb_proj', 'distort_proj',
+                               'noise_head', 'reverb_head', 'distort_head']:
+                    if name.startswith(prefix) and name in state:
+                        param.data.copy_(state[name])
+                        loaded.append(name)
+                        break
+
+        log.info(f"Stage 1: loaded {len(loaded)} parameters from {ckpt_path}")
+
+        # Freeze encoder pipeline: WavLM + post_cnn + projs + heads
+        freeze_modules = [self.noise_encoder, self.post_cnn,
+                          self.noise_proj, self.reverb_proj, self.distort_proj,
+                          self.noise_head, self.reverb_head, self.distort_head]
+        frozen_count = 0
+        for module in freeze_modules:
+            for p in module.parameters():
+                p.requires_grad = False
+                frozen_count += 1
+
+        log.info(f"Stage 2: frozen {frozen_count} encoder pipeline parameters")
+
+        # Force aux_loss_weight=0 (heads are frozen, no point computing aux gradients)
+        self.aux_loss_weight = 0.0
+        log.info("Stage 2: aux_loss_weight set to 0.0 (encoder frozen)")
 
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
