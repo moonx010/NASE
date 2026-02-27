@@ -92,16 +92,7 @@ class WavLMEncoder(nn.Module):
         # NC classification head (same role as BEATs predictor)
         self.predictor_dropout = nn.Dropout(0.1)
 
-        if multi_degradation:
-            # 11-class noise classification (10 DEMAND + "none")
-            self.noise_head = nn.Linear(768, 11)
-            # Reverb T60 regression
-            self.reverb_head = nn.Sequential(
-                nn.Linear(768, 256), nn.ReLU(), nn.Linear(256, 1))
-            # Distortion intensity regression
-            self.distort_head = nn.Sequential(
-                nn.Linear(768, 256), nn.ReLU(), nn.Linear(256, 1))
-        else:
+        if not multi_degradation:
             self.predictor = nn.Linear(768, predictor_class)
 
     def forward(self, source: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
@@ -126,10 +117,8 @@ class WavLMEncoder(nn.Module):
         pooled = x.mean(dim=1)  # (B, 768)
 
         if self.multi_degradation:
-            noise_logits = torch.sigmoid(self.noise_head(pooled))  # (B, 11)
-            reverb_pred = torch.sigmoid(self.reverb_head(pooled))  # (B, 1) — clamp to [0,1]
-            distort_pred = torch.sigmoid(self.distort_head(pooled))  # (B, 1)
-            return embedding, noise_logits, None, reverb_pred, distort_pred
+            # Multi-degradation: return embedding only (heads are in ScoreModel)
+            return embedding
         else:
             logits = self.predictor(x)  # (B, T_frames, predictor_class)
             logits = logits.mean(dim=1)  # (B, predictor_class)
