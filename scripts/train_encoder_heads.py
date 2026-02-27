@@ -192,9 +192,13 @@ def main():
     parser.add_argument('--save_dir', type=str, default='logs/stage1')
     args = parser.parse_args()
 
-    # Data
-    train_ds = MultiDegWavDataset(args.base_dir, 'train')
-    val_ds = MultiDegWavDataset(args.base_dir, 'valid')
+    # Data — split train into train/val (90/10) since valid/ has no labels
+    full_ds = MultiDegWavDataset(args.base_dir, 'train')
+    val_size = len(full_ds) // 10
+    train_size = len(full_ds) - val_size
+    train_ds, val_ds = torch.utils.data.random_split(
+        full_ds, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42))
 
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True,
