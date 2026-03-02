@@ -34,6 +34,7 @@ if __name__ == '__main__':
      parser.add_argument("--panns_ckpt", type=str, default=None, help="Path to pretrained PANNs CNN14 checkpoint (only for --encoder_type panns)")
      parser.add_argument("--max_epochs", type=int, default=160)
      parser.add_argument("--gpus", type=int, default=1, help="Number of GPUs")
+     parser.add_argument("--resume_ckpt", type=str, default=None, help="Path to checkpoint to resume training from")
 
      # ScoreModel args
      ScoreModel.add_argparse_args(parser)
@@ -56,7 +57,7 @@ if __name__ == '__main__':
                val = getattr(args, key, None)
                if key not in ('backbone', 'sde', 'no_wandb', 'wandb_project', 'wandb_name',
                               'pretrain_class_model', 'inject_type', 'encoder_type',
-                              'panns_ckpt', 'max_epochs', 'gpus'):
+                              'panns_ckpt', 'max_epochs', 'gpus', 'resume_ckpt'):
                     model_kwargs[key] = val
 
      # Initialize model
@@ -108,4 +109,4 @@ if __name__ == '__main__':
      )
 
      # Train
-     trainer.fit(model)
+     trainer.fit(model, ckpt_path=args.resume_ckpt)
