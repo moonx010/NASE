@@ -133,12 +133,13 @@ class ScoreModel(pl.LightningModule):
             self.noise_proj = nn.Linear(256, 128)
             self.reverb_proj = nn.Linear(256, 128)
             self.distort_proj = nn.Linear(256, 128)
-            # Auxiliary heads on 128-dim proj output (Option C: explicit per-branch supervision)
-            self.noise_head = nn.Linear(128, 11)
+            # Auxiliary heads on encoder output (768-dim for WavLM, before projs)
+            enc_dim = 768 if encoder_type == "wavlm" else 256
+            self.noise_head = nn.Linear(enc_dim, 11)
             self.reverb_head = nn.Sequential(
-                nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 1))
+                nn.Linear(enc_dim, 256), nn.ReLU(), nn.Linear(256, 1))
             self.distort_head = nn.Sequential(
-                nn.Linear(128, 64), nn.ReLU(), nn.Linear(64, 1))
+                nn.Linear(enc_dim, 256), nn.ReLU(), nn.Linear(256, 1))
             if inject_method == "temb":
                 # Combined → temb dimension (nf*4 = 512) for deep injection
                 self.cond_to_temb = nn.Sequential(
@@ -454,11 +455,12 @@ class ScoreModel(pl.LightningModule):
         reverb_feat = self.reverb_proj(shared)  # (B, 128)
         distort_feat = self.distort_proj(shared)  # (B, 128)
 
-        # Auxiliary heads on pre-dropout proj outputs
-        # Gradient: L_aux → heads → projs → post_cnn → WavLM
-        noise_logits = torch.sigmoid(self.noise_head(noise_feat))     # (B, 11)
-        reverb_pred = torch.sigmoid(self.reverb_head(reverb_feat))    # (B, 1)
-        distort_pred = torch.sigmoid(self.distort_head(distort_feat)) # (B, 1)
+        # Auxiliary heads on raw encoder output (768-dim, before post_cnn)
+        # This matches v2 architecture where heads were inside WavLMEncoder
+        enc_pooled = noise_emb.mean(dim=-1)  # (B, 768)
+        noise_logits = torch.sigmoid(self.noise_head(enc_pooled))     # (B, 11)
+        reverb_pred = torch.sigmoid(self.reverb_head(enc_pooled))     # (B, 1)
+        distort_pred = torch.sigmoid(self.distort_head(enc_pooled))   # (B, 1)
 
         # Independent dropout per branch AFTER head computation (training only)
         if self.training:
@@ -591,9 +593,8 @@ class ScoreModel(pl.LightningModule):
             if self.multi_degradation:
                 noise_emb = self.noise_encoder(y_wav.squeeze(1))
                 noise_emb = noise_emb.transpose(1, 2).contiguous()
-                shared = self.post_cnn(noise_emb).mean(dim=-1)
-                noise_feat = self.noise_proj(shared)
-                logits = torch.sigmoid(self.noise_head(noise_feat))
+                enc_pooled = noise_emb.mean(dim=-1)  # (B, 768)
+                logits = torch.sigmoid(self.noise_head(enc_pooled))
             else:
                 enc_out = self.noise_encoder(y_wav.squeeze(1))
                 logits = enc_out[1]  # works for both 3-tuple and 5-tuple
@@ -726,13 +727,10 @@ class ScoreModel(pl.LightningModule):
         with torch.no_grad():
             noise_emb = self.noise_encoder(y_wav.squeeze(1))
             noise_emb = noise_emb.transpose(1, 2).contiguous()
-            shared = self.post_cnn(noise_emb).mean(dim=-1)
-            noise_feat = self.noise_proj(shared)
-            reverb_feat = self.reverb_proj(shared)
-            distort_feat = self.distort_proj(shared)
-            noise_logits = torch.sigmoid(self.noise_head(noise_feat))
-            reverb_pred = torch.sigmoid(self.reverb_head(reverb_feat))
-            distort_pred = torch.sigmoid(self.distort_head(distort_feat))
+            enc_pooled = noise_emb.mean(dim=-1)  # (B, 768)
+            noise_logits = torch.sigmoid(self.noise_head(enc_pooled))
+            reverb_pred = torch.sigmoid(self.reverb_head(enc_pooled))
+            distort_pred = torch.sigmoid(self.distort_head(enc_pooled))
             # noise_logits is sigmoid-applied (B, 11). Convert back to raw logits
             # then apply softmax for proper probability distribution.
             raw_logits = torch.logit(noise_logits.clamp(1e-6, 1 - 1e-6))
